@@ -1,7 +1,5 @@
 const fs = require("fs");
 const path = require("path");
-const PREVIEW_ONLY = process.env.PREVIEW_ONLY === "true";
-
 const cheerio = require("cheerio");
 const crypto = require("crypto");
 const { chromium } = require("playwright");
@@ -11,6 +9,7 @@ const REPORT_URL_TEMPLATE = "https://cn.2firsts.com/report/detail?date={date}";
 const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK || "";
 const FEISHU_SECRET = process.env.FEISHU_SECRET || "";
 const FEISHU_KEYWORD = process.env.FEISHU_KEYWORD || "2F早报";
+const PREVIEW_ONLY = process.env.PREVIEW_ONLY === "true";
 
 const STOP_SECTION_RE = /^(查看更多|热门资讯|专题报道|特别报道|产品|快讯|厂商|合规|地区资讯)$/;
 const SKIP_LINE_RE = /^(前一天|<前一天|选择日期|全部)$/;
@@ -38,6 +37,10 @@ function buildReportUrl(dateText) {
 
 function cleanText(text = "") {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function cleanSourceName(text = "") {
+  return cleanText(text).replace(/[，,;；。]+$/g, "").trim();
 }
 
 function absoluteUrl(url) {
@@ -118,7 +121,7 @@ function buildSourceMap($) {
 
   $("a[href]").each((_, el) => {
     const href = absoluteUrl($(el).attr("href"));
-    const text = cleanText($(el).text());
+    const text = cleanSourceName($(el).text());
 
     if (!href || !text) return;
     if (!isExternalUrl(href)) return;
@@ -138,7 +141,10 @@ function splitTailSource(text, sourceNames) {
 
   for (const sourceName of sourceNames) {
     if (cleaned === sourceName) {
-      return { title: "", sourceName };
+      return {
+        title: "",
+        sourceName
+      };
     }
 
     if (cleaned.endsWith(` ${sourceName}`)) {
@@ -163,8 +169,8 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
     .filter(Boolean);
 
   const headerIndex = lines.findIndex((line, idx) => {
-    const nearby = lines.slice(idx, idx + 4).join(" ");
-    return line.includes("早报") && line.includes(dateInfo.monthDay) && nearby.includes(dateInfo.year);
+    const nearby = lines.slice(idx, idx + 5).join(" ");
+    return line.includes("早报") && nearby.includes(dateInfo.monthDay) && nearby.includes(dateInfo.year);
   });
 
   if (headerIndex === -1) {
@@ -186,57 +192,24 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
       items.push({
         title,
         sourceName: current.sourceName || "链接",
-        sourceUrl: current.sourceUrl || ""
+        sourceUrl: current.sourceUrl || "",
+        url: ""
       });
     }
 
     current = null;
   }
 
-  for (let i = headerIndex + 1; i < lines.length; i++) {
-    const line = lines[i];
+  function processContentLine(line) {
+    if (!current) return;
 
-    if (!line) continue;
-    if (STOP_SECTION_RE.test(line)) break;
-    if (SKIP_LINE_RE.test(line)) continue;
-    if (line === dateInfo.year || line === dateInfo.monthDay) continue;
+    const normalizedSource = cleanSourceName(line);
 
-    const numbered = line.match(/^(\d{1,2})\s*(.*)$/);
-
-    if (numbered) {
+    if (!current.sourceName && sourceMap.has(normalizedSource)) {
+      current.sourceName = normalizedSource;
+      current.sourceUrl = sourceMap.get(normalizedSource) || "";
       pushCurrent();
-
-      current = {
-        titleParts: [],
-        sourceName: "",
-        sourceUrl: ""
-      };
-
-      const rest = cleanText(numbered[2]);
-      if (rest) {
-        const parsed = splitTailSource(rest, sourceNames);
-        if (parsed.title) {
-          current.titleParts.push(parsed.title);
-        }
-        if (parsed.sourceName) {
-          current.sourceName = parsed.sourceName;
-          current.sourceUrl = sourceMap.get(parsed.sourceName) || "";
-          pushCurrent();
-        }
-      }
-
-      continue;
-    }
-
-    if (!current) {
-      continue;
-    }
-
-    if (!current.sourceName && sourceMap.has(line)) {
-      current.sourceName = line;
-      current.sourceUrl = sourceMap.get(line) || "";
-      pushCurrent();
-      continue;
+      return;
     }
 
     const parsed = splitTailSource(line, sourceNames);
@@ -249,6 +222,44 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
       current.sourceUrl = sourceMap.get(parsed.sourceName) || "";
       pushCurrent();
     }
+  }
+
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (!line) continue;
+    if (STOP_SECTION_RE.test(line)) break;
+    if (SKIP_LINE_RE.test(line)) continue;
+    if (line === dateInfo.year || line === dateInfo.monthDay) continue;
+
+    const pureNumber = line.match(/^(\d{1,2})$/);
+    if (pureNumber) {
+      pushCurrent();
+      current = {
+        titleParts: [],
+        sourceName: "",
+        sourceUrl: ""
+      };
+      continue;
+    }
+
+    const numberedLine = line.match(/^(\d{1,2})\s*(.*)$/);
+    if (numberedLine && line !== dateInfo.year) {
+      pushCurrent();
+      current = {
+        titleParts: [],
+        sourceName: "",
+        sourceUrl: ""
+      };
+
+      const rest = cleanText(numberedLine[2]);
+      if (rest) {
+        processContentLine(rest);
+      }
+      continue;
+    }
+
+    processContentLine(line);
   }
 
   pushCurrent();
@@ -299,7 +310,7 @@ function buildMessage({ dateText, mode, items }) {
     const linkHref =
       mode === "daily_report"
         ? (item.sourceUrl || HOME_URL)
-        : item.url;
+        : (item.url || HOME_URL);
 
     content.push([
       { tag: "text", text: `${index + 1}. ${item.title} ` },
@@ -325,7 +336,7 @@ function buildMessage({ dateText, mode, items }) {
   };
 }
 
-async function (payload) {
+async function sendToFeishu(payload) {
   if (!FEISHU_WEBHOOK) {
     throw new Error("Missing FEISHU_WEBHOOK");
   }
@@ -359,6 +370,7 @@ function buildPreviewData({ dateText, mode, items, reportUrl, debug }) {
     previewOnly: PREVIEW_ONLY,
     date: dateText,
     mode,
+    strategy: mode === "daily_report" ? "report_detail" : "homepage_fallback",
     count: items.length,
     reportUrl,
     items,
@@ -381,6 +393,7 @@ function writePreviewFiles(preview) {
     `# ${FEISHU_KEYWORD}｜${preview.date}`,
     "",
     `- 模式：${modeText}`,
+    `- 策略：${preview.strategy}`,
     `- 条数：${preview.count}`,
     `- 早报链接：${preview.reportUrl}`,
     `- 预览模式：${preview.previewOnly ? "是" : "否"}`,
@@ -396,7 +409,7 @@ function writePreviewFiles(preview) {
 
     const linkHref =
       preview.mode === "daily_report"
-        ? (item.sourceUrl || item.url || HOME_URL)
+        ? (item.sourceUrl || HOME_URL)
         : (item.url || HOME_URL);
 
     lines.push(`${index + 1}. ${item.title}`);
@@ -407,6 +420,13 @@ function writePreviewFiles(preview) {
   lines.push("## Debug");
   lines.push(`- reportItemCount: ${preview.debug.reportItemCount}`);
   lines.push(`- fallbackItemCount: ${preview.debug.fallbackItemCount}`);
+  lines.push(`- reportError: ${preview.debug.reportError || ""}`);
+  lines.push(`- fallbackError: ${preview.debug.fallbackError || ""}`);
+  lines.push("");
+  lines.push("## Report Text Sample");
+  lines.push("```text");
+  lines.push(preview.debug.reportTextSample || "");
+  lines.push("```");
 
   const markdown = lines.join("\n");
 
@@ -421,38 +441,40 @@ function writePreviewFiles(preview) {
   }
 }
 
-
 async function main() {
   const dateInfo = nowInShanghai();
+  const reportUrl = buildReportUrl(dateInfo.dateText);
 
   let items = [];
   let mode = "daily_report";
   let reportItems = [];
   let fallbackItems = [];
-
-  const reportUrl = buildReportUrl(dateInfo.dateText);
+  let reportError = "";
+  let fallbackError = "";
+  let reportTextSample = "";
 
   // 1. 优先抓当天早报详情页
   try {
     const rendered = await fetchRenderedReportPage(reportUrl);
-    reportItems = extractDailyReportFromDetail(
-      rendered.text,
-      rendered.html,
-      dateInfo
-    );
+    reportTextSample = rendered.text.slice(0, 3000);
+    reportItems = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
     items = reportItems;
   } catch (err) {
-    reportItems = [];
+    reportError = err.message || String(err);
     items = [];
   }
 
-  // 2. 没有当天早报，再回退首页 48 小时热点
+  // 2. 如果当天没有早报，再回退首页 48 小时热点
   if (!items.length) {
-    const homeHtml = await fetchHtml(HOME_URL);
-    const $home = cheerio.load(homeHtml);
-    fallbackItems = extractFallbackNews($home);
-    items = fallbackItems;
-    mode = "fallback_news";
+    try {
+      const homeHtml = await fetchHtml(HOME_URL);
+      const $home = cheerio.load(homeHtml);
+      fallbackItems = extractFallbackNews($home);
+      items = fallbackItems;
+      mode = "fallback_news";
+    } catch (err) {
+      fallbackError = err.message || String(err);
+    }
   }
 
   const preview = buildPreviewData({
@@ -462,17 +484,22 @@ async function main() {
     reportUrl,
     debug: {
       reportItemCount: reportItems.length,
-      fallbackItemCount: fallbackItems.length
+      fallbackItemCount: fallbackItems.length,
+      reportError,
+      fallbackError,
+      reportTextSample
     }
   });
 
   writePreviewFiles(preview);
 
+  // 3. 没有内容则静默不发群
   if (!items.length) {
     console.log("No news extracted, skip sending");
     return;
   }
 
+  // 4. 预览模式不发飞书
   if (PREVIEW_ONLY) {
     console.log("Preview only, skip sending to Feishu");
     return;
@@ -499,9 +526,6 @@ async function main() {
     )
   );
 }
-
-
-
 
 main().catch((err) => {
   console.error(err);
