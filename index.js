@@ -1,5 +1,6 @@
 const cheerio = require("cheerio");
 const crypto = require("crypto");
+const { chromium } = require("playwright");
 
 const HOME_URL = "https://cn.2firsts.com/";
 const REPORT_URL_TEMPLATE = "https://cn.2firsts.com/report/detail?date={date}";
@@ -7,19 +8,23 @@ const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK || "";
 const FEISHU_SECRET = process.env.FEISHU_SECRET || "";
 const FEISHU_KEYWORD = process.env.FEISHU_KEYWORD || "2F早报";
 
+const STOP_SECTION_RE = /^(查看更多|热门资讯|专题报道|特别报道|产品|快讯|厂商|合规|地区资讯)$/;
+const SKIP_LINE_RE = /^(前一天|<前一天|选择日期|全部)$/;
+
 function nowInShanghai() {
   const now = new Date();
   const shanghai = new Date(
     now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" })
   );
 
-  const year = shanghai.getFullYear();
+  const year = String(shanghai.getFullYear());
   const month = String(shanghai.getMonth() + 1).padStart(2, "0");
   const day = String(shanghai.getDate()).padStart(2, "0");
 
   return {
     dateText: `${year}-${month}-${day}`,
-    reportMarker: `${month}.${day} ${year}`
+    monthDay: `${month}.${day}`,
+    year
   };
 }
 
@@ -56,6 +61,15 @@ function buildSign(secret, timestamp) {
   return crypto.createHmac("sha256", stringToSign).digest("base64");
 }
 
+function isExternalUrl(url) {
+  try {
+    const parsed = new URL(url, HOME_URL);
+    return !parsed.hostname.includes("2firsts.com");
+  } catch {
+    return false;
+  }
+}
+
 async function fetchHtml(url) {
   const res = await fetch(url, {
     headers: {
@@ -70,31 +84,170 @@ async function fetchHtml(url) {
   return await res.text();
 }
 
-function extractDailyReportFromDetail($, marker) {
-  const pageText = cleanText($.root().text());
+async function fetchRenderedReportPage(url) {
+  const browser = await chromium.launch({ headless: true });
 
-  if (!pageText.includes("早报") || !pageText.includes(marker)) {
-    return [];
+  try {
+    const page = await browser.newPage({
+      userAgent: "Mozilla/5.0"
+    });
+
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000
+    });
+
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    const html = await page.content();
+    const text = await page.locator("body").innerText().catch(() => "");
+
+    return { html, text };
+  } finally {
+    await browser.close();
   }
+}
 
-  const items = [];
+function buildSourceMap($) {
+  const sourceMap = new Map();
 
   $("a[href]").each((_, el) => {
     const href = absoluteUrl($(el).attr("href"));
     const text = cleanText($(el).text());
 
-    if (!href.includes("/news/")) return;
-    if (!text) return;
-    if (text === "全部" || text === "前一天" || text === "选择日期") return;
+    if (!href || !text) return;
+    if (!isExternalUrl(href)) return;
+    if (text.length > 80) return;
+    if (SKIP_LINE_RE.test(text)) return;
 
-    // 早报详情正文通常是较长的摘要，过滤短标题
-    if (text.length < 35) return;
-
-    items.push({
-      title: text,
-      url: href
-    });
+    if (!sourceMap.has(text)) {
+      sourceMap.set(text, href);
+    }
   });
+
+  return sourceMap;
+}
+
+function splitTailSource(text, sourceNames) {
+  const cleaned = cleanText(text);
+
+  for (const sourceName of sourceNames) {
+    if (cleaned === sourceName) {
+      return { title: "", sourceName };
+    }
+
+    if (cleaned.endsWith(` ${sourceName}`)) {
+      return {
+        title: cleanText(cleaned.slice(0, -sourceName.length)),
+        sourceName
+      };
+    }
+  }
+
+  return {
+    title: cleaned,
+    sourceName: ""
+  };
+}
+
+function extractDailyReportFromDetail(renderedText, html, dateInfo) {
+  const normalizedText = renderedText.replace(/\r/g, "");
+  const lines = normalizedText
+    .split("\n")
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  const headerIndex = lines.findIndex((line, idx) => {
+    const nearby = lines.slice(idx, idx + 4).join(" ");
+    return line.includes("早报") && line.includes(dateInfo.monthDay) && nearby.includes(dateInfo.year);
+  });
+
+  if (headerIndex === -1) {
+    return [];
+  }
+
+  const $ = cheerio.load(html);
+  const sourceMap = buildSourceMap($);
+  const sourceNames = Array.from(sourceMap.keys()).sort((a, b) => b.length - a.length);
+
+  const items = [];
+  let current = null;
+
+  function pushCurrent() {
+    if (!current) return;
+
+    const title = cleanText(current.titleParts.join(" "));
+    if (title.length >= 20) {
+      items.push({
+        title,
+        sourceName: current.sourceName || "链接",
+        sourceUrl: current.sourceUrl || ""
+      });
+    }
+
+    current = null;
+  }
+
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (!line) continue;
+    if (STOP_SECTION_RE.test(line)) break;
+    if (SKIP_LINE_RE.test(line)) continue;
+    if (line === dateInfo.year || line === dateInfo.monthDay) continue;
+
+    const numbered = line.match(/^(\d{1,2})\s*(.*)$/);
+
+    if (numbered) {
+      pushCurrent();
+
+      current = {
+        titleParts: [],
+        sourceName: "",
+        sourceUrl: ""
+      };
+
+      const rest = cleanText(numbered[2]);
+      if (rest) {
+        const parsed = splitTailSource(rest, sourceNames);
+        if (parsed.title) {
+          current.titleParts.push(parsed.title);
+        }
+        if (parsed.sourceName) {
+          current.sourceName = parsed.sourceName;
+          current.sourceUrl = sourceMap.get(parsed.sourceName) || "";
+          pushCurrent();
+        }
+      }
+
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    if (!current.sourceName && sourceMap.has(line)) {
+      current.sourceName = line;
+      current.sourceUrl = sourceMap.get(line) || "";
+      pushCurrent();
+      continue;
+    }
+
+    const parsed = splitTailSource(line, sourceNames);
+    if (parsed.title) {
+      current.titleParts.push(parsed.title);
+    }
+
+    if (!current.sourceName && parsed.sourceName) {
+      current.sourceName = parsed.sourceName;
+      current.sourceUrl = sourceMap.get(parsed.sourceName) || "";
+      pushCurrent();
+    }
+  }
+
+  pushCurrent();
 
   return uniqueByTitle(items).slice(0, 10);
 }
@@ -136,9 +289,17 @@ function buildMessage({ dateText, mode, items }) {
   ];
 
   items.forEach((item, index) => {
+    const linkText =
+      mode === "daily_report" ? (item.sourceName || "链接") : "链接";
+
+    const linkHref =
+      mode === "daily_report"
+        ? (item.sourceUrl || HOME_URL)
+        : item.url;
+
     content.push([
       { tag: "text", text: `${index + 1}. ${item.title} ` },
-      { tag: "a", text: "链接", href: item.url }
+      { tag: "a", text: linkText, href: linkHref }
     ]);
   });
 
@@ -189,22 +350,21 @@ async function sendToFeishu(payload) {
 }
 
 async function main() {
-  const { dateText, reportMarker } = nowInShanghai();
+  const dateInfo = nowInShanghai();
 
   let items = [];
   let mode = "daily_report";
 
-  // 1. 优先抓当天早报详情页
+  // 1. 先抓当天动态早报详情页
   try {
-    const reportUrl = buildReportUrl(dateText);
-    const reportHtml = await fetchHtml(reportUrl);
-    const $report = cheerio.load(reportHtml);
-    items = extractDailyReportFromDetail($report, reportMarker);
+    const reportUrl = buildReportUrl(dateInfo.dateText);
+    const rendered = await fetchRenderedReportPage(reportUrl);
+    items = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
   } catch (err) {
     items = [];
   }
 
-  // 2. 如果当天没有早报，再抓首页近期热点
+  // 2. 如果当天没有早报，再回退首页 48 小时内热点
   if (!items.length) {
     const homeHtml = await fetchHtml(HOME_URL);
     const $home = cheerio.load(homeHtml);
@@ -212,14 +372,14 @@ async function main() {
     mode = "fallback_news";
   }
 
-  // 3. 没有内容则静默失败，不发群
+  // 3. 没有内容则静默不发群
   if (!items.length) {
     console.log("No news extracted, skip sending");
     return;
   }
 
   const payload = buildMessage({
-    dateText,
+    dateText: dateInfo.dateText,
     mode,
     items
   });
@@ -230,7 +390,7 @@ async function main() {
     JSON.stringify(
       {
         ok: true,
-        dateText,
+        dateText: dateInfo.dateText,
         mode,
         count: items.length
       },
