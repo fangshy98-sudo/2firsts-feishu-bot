@@ -91,7 +91,7 @@ async function fetchHtml(url) {
   return await res.text();
 }
 
-async function fetchRenderedReportPage(url) {
+async function fetchRenderedReportPage(url, dateInfo) {
   const browser = await chromium.launch({ headless: true });
 
   try {
@@ -105,7 +105,18 @@ async function fetchRenderedReportPage(url) {
     });
 
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+
+    // 关键：明确等待页面真正出现目标日期
+    await page.waitForFunction(
+      ({ monthDay, year }) => {
+        const text = document.body?.innerText || "";
+        return text.includes("早报") && text.includes(monthDay) && text.includes(year);
+      },
+      { monthDay: dateInfo.monthDay, year: dateInfo.year },
+      { timeout: 15000 }
+    ).catch(() => {});
+
+    await page.waitForTimeout(1000);
 
     const html = await page.content();
     const text = await page.locator("body").innerText().catch(() => "");
@@ -441,6 +452,13 @@ function writePreviewFiles(preview) {
   }
 }
 
+function extractObservedReportDate(text) {
+  const normalized = text.replace(/\r/g, "");
+  const match = normalized.match(/早报\s*\/\s*(\d{2}\.\d{2})\s*\n?\s*(\d{4})/);
+  return match ? `${match[1]} ${match[2]}` : "";
+}
+
+
 async function main() {
   const dateInfo = nowInShanghai();
   const reportUrl = buildReportUrl(dateInfo.dateText);
@@ -452,10 +470,11 @@ async function main() {
   let reportError = "";
   let fallbackError = "";
   let reportTextSample = "";
+  let observedReportDate = "";
 
   // 1. 优先抓当天早报详情页
   try {
-    const rendered = await fetchRenderedReportPage(reportUrl);
+    const rendered = await fetchRenderedReportPage(reportUrl, dateInfo);
     reportTextSample = rendered.text.slice(0, 3000);
     reportItems = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
     items = reportItems;
@@ -463,6 +482,7 @@ async function main() {
     reportError = err.message || String(err);
     items = [];
   }
+  observedReportDate = extractObservedReportDate(rendered.text);
 
   // 2. 如果当天没有早报，再回退首页 48 小时热点
   if (!items.length) {
@@ -482,12 +502,14 @@ async function main() {
     mode,
     items,
     reportUrl,
+
     debug: {
       reportItemCount: reportItems.length,
       fallbackItemCount: fallbackItems.length,
       reportError,
       fallbackError,
-      reportTextSample
+      reportTextSample,
+      observedReportDate
     }
   });
 
