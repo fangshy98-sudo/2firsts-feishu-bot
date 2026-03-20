@@ -2,6 +2,7 @@ const cheerio = require("cheerio");
 const crypto = require("crypto");
 
 const HOME_URL = "https://cn.2firsts.com/";
+const REPORT_URL_TEMPLATE = "https://cn.2firsts.com/report/detail?date={date}";
 const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK || "";
 const FEISHU_SECRET = process.env.FEISHU_SECRET || "";
 const FEISHU_KEYWORD = process.env.FEISHU_KEYWORD || "2F早报";
@@ -20,6 +21,10 @@ function nowInShanghai() {
     dateText: `${year}-${month}-${day}`,
     reportMarker: `${month}.${day} ${year}`
   };
+}
+
+function buildReportUrl(dateText) {
+  return REPORT_URL_TEMPLATE.replace("{date}", dateText);
 }
 
 function cleanText(text = "") {
@@ -65,48 +70,34 @@ async function fetchHtml(url) {
   return await res.text();
 }
 
-function extractDailyReport($, marker) {
-  const allNodes = $("body *").toArray();
-  const startIndex = allNodes.findIndex((el) => {
-    const text = cleanText($(el).text());
-    return text.includes("早报") && text.includes(marker);
-  });
+function extractDailyReportFromDetail($, marker) {
+  const pageText = cleanText($.root().text());
 
-  if (startIndex === -1) return [];
+  if (!pageText.includes("早报") || !pageText.includes(marker)) {
+    return [];
+  }
 
   const items = [];
 
-  for (let i = startIndex + 1; i < allNodes.length; i++) {
-    const node = allNodes[i];
-    const text = cleanText($(node).text());
+  $("a[href]").each((_, el) => {
+    const href = absoluteUrl($(el).attr("href"));
+    const text = cleanText($(el).text());
 
-    if (!text) continue;
+    if (!href.includes("/news/")) return;
+    if (!text) return;
+    if (text === "全部" || text === "前一天" || text === "选择日期") return;
 
-    if (/^(查看更多|热门资讯|专题报道|特别报道|产品|快讯|厂商|合规)$/.test(text)) {
-      break;
-    }
+    // 早报详情正文通常是较长的摘要，过滤短标题
+    if (text.length < 35) return;
 
-    const links = $(node).find("a[href]").addBack("a[href]").toArray();
-
-    for (const link of links) {
-      const href = absoluteUrl($(link).attr("href"));
-      const title = cleanText($(link).text());
-
-      if (!href.includes("/news/")) continue;
-      if (!title || title === "全部") continue;
-
-      items.push({
-        title,
-        url: href
-      });
-    }
-
-    if (items.length >= 12) break;
-  }
+    items.push({
+      title: text,
+      url: href
+    });
+  });
 
   return uniqueByTitle(items).slice(0, 10);
 }
-
 
 function extractFallbackNews($) {
   const items = [];
@@ -129,7 +120,6 @@ function extractFallbackNews($) {
 
     items.push({
       title,
-      timeTag,
       url: href
     });
   });
@@ -140,11 +130,10 @@ function extractFallbackNews($) {
 function buildMessage({ dateText, mode, items }) {
   const modeText = mode === "daily_report" ? "早报" : "近期热点";
 
-const content = [
-  [{ tag: "text", text: `模式：${modeText}` }],
-  [{ tag: "text", text: "" }]
-];
-
+  const content = [
+    [{ tag: "text", text: `模式：${modeText}` }],
+    [{ tag: "text", text: "" }]
+  ];
 
   items.forEach((item, index) => {
     content.push([
@@ -199,32 +188,43 @@ async function sendToFeishu(payload) {
   return data;
 }
 
-
 async function main() {
   const { dateText, reportMarker } = nowInShanghai();
-  const html = await fetchHtml(HOME_URL);
-  const $ = cheerio.load(html);
 
-  let items = extractDailyReport($, reportMarker);
+  let items = [];
   let mode = "daily_report";
 
+  // 1. 优先抓当天早报详情页
+  try {
+    const reportUrl = buildReportUrl(dateText);
+    const reportHtml = await fetchHtml(reportUrl);
+    const $report = cheerio.load(reportHtml);
+    items = extractDailyReportFromDetail($report, reportMarker);
+  } catch (err) {
+    items = [];
+  }
+
+  // 2. 如果当天没有早报，再抓首页近期热点
   if (!items.length) {
-    items = extractFallbackNews($);
+    const homeHtml = await fetchHtml(HOME_URL);
+    const $home = cheerio.load(homeHtml);
+    items = extractFallbackNews($home);
     mode = "fallback_news";
   }
 
+  // 3. 没有内容则静默失败，不发群
   if (!items.length) {
-    throw new Error("No news extracted from homepage");
+    console.log("No news extracted, skip sending");
+    return;
   }
 
-const payload = buildMessage({
-  dateText,
-  mode,
-  items
-});
+  const payload = buildMessage({
+    dateText,
+    mode,
+    items
+  });
 
-await sendToFeishu(payload);
-
+  await sendToFeishu(payload);
 
   console.log(
     JSON.stringify(
