@@ -2,12 +2,28 @@ name: Push 2Firsts Daily Report
 
 on:
   schedule:
-    - cron: "5 1 * * *"
+    - cron: "36 1 * * *"
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: Optional date in YYYY-MM-DD format. Leave blank to use today in Asia/Shanghai.
+        required: false
+        default: ""
+      preview_only:
+        description: true = only generate preview artifact, false = actually send to Feishu
+        required: true
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
 
 jobs:
   run-job:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -18,15 +34,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
-
-      - name: Generate preview only
+      - name: Run sender
         env:
-          PREVIEW_ONLY: "true"
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+          PREVIEW_ONLY: ${{ github.event.inputs.preview_only || 'false' }}
+          TIME_ZONE: Asia/Shanghai
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
         run: node index.js
 
@@ -36,3 +49,4 @@ jobs:
         with:
           name: 2firsts-preview
           path: preview/
+          if-no-files-found: warn
