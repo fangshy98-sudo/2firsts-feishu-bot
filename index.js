@@ -441,13 +441,14 @@ async function writePreview(result) {
 }
 
 function buildPreviewMarkdown(result) {
+  const title = buildFeishuTitle(result);
   const lines = [
     '# 2Firsts Preview',
     '',
     `- 目标日期: ${result.requestedDate}`,
     `- 模式: ${result.mode}`,
     `- 策略: ${result.strategy}`,
-    `- 标题: ${result.title || ''}`,
+    `- 标题: ${title}`,
     `- 条数: ${result.itemCount || 0}`,
     `- 来源页: ${result.sourceUrl || ''}`,
     '',
@@ -462,14 +463,7 @@ function buildPreviewMarkdown(result) {
 
   for (const item of result.items) {
     lines.push(`${item.index}. ${item.title}`);
-    lines.push(`   来源: ${item.source || '未标注'}`);
-    lines.push(`   链接: ${item.articleUrl || ''}`);
-    if (item.timeText) {
-      lines.push(`   时间: ${item.timeText}`);
-    }
-    if (item.summary) {
-      lines.push(`   摘要: ${item.summary}`);
-    }
+    lines.push(`[链接](${item.articleUrl || ''})`);
     lines.push('');
   }
 
@@ -477,13 +471,7 @@ function buildPreviewMarkdown(result) {
 }
 
 async function sendToFeishu(result) {
-  const text = buildFeishuText(result);
-  const payload = {
-    msg_type: 'text',
-    content: {
-      text: FEISHU_KEYWORD ? `${FEISHU_KEYWORD}\n${text}` : text,
-    },
-  };
+  const payload = buildFeishuPostPayload(result);
 
   const response = await fetch(FEISHU_WEBHOOK, {
     method: 'POST',
@@ -503,24 +491,38 @@ async function sendToFeishu(result) {
   console.log('[info] feishu send success');
 }
 
-function buildFeishuText(result) {
-  const header =
-    result.mode === 'report_detail'
-      ? `2Firsts 今日早报 ${result.resolvedDate || result.requestedDate}`
-      : `2Firsts 近${FALLBACK_HOURS}小时热点回退 ${result.requestedDate}`;
+function buildFeishuPostPayload(result) {
+  const content = [];
+  const title = buildFeishuTitle(result);
 
-  const lines = [header];
-
-  for (const item of result.items) {
-    lines.push('');
-    lines.push(`${item.index}. ${item.title}`);
-    if (item.source) {
-      lines.push(`来源：${item.source}`);
-    }
-    lines.push(`链接：${item.articleUrl}`);
+  if (FEISHU_KEYWORD) {
+    content.push([{ tag: 'text', text: FEISHU_KEYWORD }]);
   }
 
-  return lines.join('\n');
+  for (const item of result.items) {
+    content.push([{ tag: 'text', text: `${item.index}. ${item.title}` }]);
+    content.push([{ tag: 'a', text: '链接', href: item.articleUrl }]);
+  }
+
+  return {
+    msg_type: 'post',
+    content: {
+      post: {
+        zh_cn: {
+          title,
+          content,
+        },
+      },
+    },
+  };
+}
+
+function buildFeishuTitle(result) {
+  if (result.mode === 'report_detail') {
+    return `2Firsts 今日早报 ${result.resolvedDate || result.requestedDate}`;
+  }
+
+  return `2Firsts 首页热点新闻 ${result.requestedDate}`;
 }
 
 async function fetchJson(url) {
@@ -631,7 +633,6 @@ function timestampToIsoDate(timestamp) {
 
   return getDateStringInTimeZone(new Date(value * 1000), TIME_ZONE);
 }
-
 
 function getDateStringInTimeZone(date, timeZone) {
   const parts = new Intl.DateTimeFormat('en-CA', {
