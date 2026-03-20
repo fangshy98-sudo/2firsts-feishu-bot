@@ -86,7 +86,7 @@ function extractDailyReport($, marker) {
       break;
     }
 
-    const links = $(node).find("a[href]").toArray();
+    const links = $(node).find("a[href]").addBack("a[href]").toArray();
 
     for (const link of links) {
       const href = absoluteUrl($(link).attr("href"));
@@ -95,7 +95,10 @@ function extractDailyReport($, marker) {
       if (!href.includes("/news/")) continue;
       if (!title || title === "全部") continue;
 
-      items.push({ title, url: href });
+      items.push({
+        title,
+        url: href
+      });
     }
 
     if (items.length >= 12) break;
@@ -137,11 +140,11 @@ function extractFallbackNews($) {
 function buildMessage({ dateText, mode, items }) {
   const modeText = mode === "daily_report" ? "早报" : "近期热点";
 
-  const content = [
-    [{ tag: "text", text: `${FEISHU_KEYWORD}｜${dateText}` }],
-    [{ tag: "text", text: `模式：${modeText}` }],
-    [{ tag: "text", text: "" }]
-  ];
+const content = [
+  [{ tag: "text", text: `模式：${modeText}` }],
+  [{ tag: "text", text: "" }]
+];
+
 
   items.forEach((item, index) => {
     content.push([
