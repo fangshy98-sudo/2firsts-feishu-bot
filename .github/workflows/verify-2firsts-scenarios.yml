@@ -1,0 +1,62 @@
+name: Verify 2Firsts Scenarios
+
+on:
+  workflow_dispatch:
+    inputs:
+      has_report_date:
+        description: Date expected to have a daily report
+        required: false
+        default: '2026-03-20'
+      no_report_date:
+        description: Date expected to fall back to homepage news
+        required: false
+        default: '2026-03-18'
+  push:
+    paths:
+      - 'index.js'
+      - 'verify-scenarios.ps1'
+      - '.github/workflows/verify-2firsts-scenarios.yml'
+  pull_request:
+    paths:
+      - 'index.js'
+      - 'verify-scenarios.ps1'
+      - '.github/workflows/verify-2firsts-scenarios.yml'
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run dual-scenario verification
+        env:
+          HAS_REPORT_DATE: ${{ github.event.inputs.has_report_date }}
+          NO_REPORT_DATE: ${{ github.event.inputs.no_report_date }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:HAS_REPORT_DATE)) {
+            $env:HAS_REPORT_DATE = '2026-03-20'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:NO_REPORT_DATE)) {
+            $env:NO_REPORT_DATE = '2026-03-18'
+          }
+
+          ./verify-scenarios.ps1 -HasReportDate $env:HAS_REPORT_DATE -NoReportDate $env:NO_REPORT_DATE
+
+      - name: Upload preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2firsts-verify-preview
+          path: preview/
+          if-no-files-found: warn
