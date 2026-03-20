@@ -1,3 +1,7 @@
+const fs = require("fs");
+const path = require("path");
+const PREVIEW_ONLY = process.env.PREVIEW_ONLY === "true";
+
 const cheerio = require("cheerio");
 const crypto = require("crypto");
 const { chromium } = require("playwright");
@@ -321,7 +325,7 @@ function buildMessage({ dateText, mode, items }) {
   };
 }
 
-async function sendToFeishu(payload) {
+async function (payload) {
   if (!FEISHU_WEBHOOK) {
     throw new Error("Missing FEISHU_WEBHOOK");
   }
@@ -349,32 +353,128 @@ async function sendToFeishu(payload) {
   return data;
 }
 
+function buildPreviewData({ dateText, mode, items, reportUrl, debug }) {
+  return {
+    generatedAt: new Date().toISOString(),
+    previewOnly: PREVIEW_ONLY,
+    date: dateText,
+    mode,
+    count: items.length,
+    reportUrl,
+    items,
+    debug
+  };
+}
+
+function writePreviewFiles(preview) {
+  const previewDir = path.join(process.cwd(), "preview");
+  fs.mkdirSync(previewDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(previewDir, "latest.json"),
+    JSON.stringify(preview, null, 2),
+    "utf8"
+  );
+
+  const modeText = preview.mode === "daily_report" ? "早报" : "近期热点";
+  const lines = [
+    `# ${FEISHU_KEYWORD}｜${preview.date}`,
+    "",
+    `- 模式：${modeText}`,
+    `- 条数：${preview.count}`,
+    `- 早报链接：${preview.reportUrl}`,
+    `- 预览模式：${preview.previewOnly ? "是" : "否"}`,
+    "",
+    "## 内容"
+  ];
+
+  preview.items.forEach((item, index) => {
+    const linkText =
+      preview.mode === "daily_report"
+        ? (item.sourceName || "链接")
+        : "链接";
+
+    const linkHref =
+      preview.mode === "daily_report"
+        ? (item.sourceUrl || item.url || HOME_URL)
+        : (item.url || HOME_URL);
+
+    lines.push(`${index + 1}. ${item.title}`);
+    lines.push(`   ${linkText}: ${linkHref}`);
+  });
+
+  lines.push("");
+  lines.push("## Debug");
+  lines.push(`- reportItemCount: ${preview.debug.reportItemCount}`);
+  lines.push(`- fallbackItemCount: ${preview.debug.fallbackItemCount}`);
+
+  const markdown = lines.join("\n");
+
+  fs.writeFileSync(
+    path.join(previewDir, "latest.md"),
+    markdown,
+    "utf8"
+  );
+
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown, "utf8");
+  }
+}
+
+
 async function main() {
   const dateInfo = nowInShanghai();
 
   let items = [];
   let mode = "daily_report";
+  let reportItems = [];
+  let fallbackItems = [];
 
-  // 1. 先抓当天动态早报详情页
+  const reportUrl = buildReportUrl(dateInfo.dateText);
+
+  // 1. 优先抓当天早报详情页
   try {
-    const reportUrl = buildReportUrl(dateInfo.dateText);
     const rendered = await fetchRenderedReportPage(reportUrl);
-    items = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
+    reportItems = extractDailyReportFromDetail(
+      rendered.text,
+      rendered.html,
+      dateInfo
+    );
+    items = reportItems;
   } catch (err) {
+    reportItems = [];
     items = [];
   }
 
-  // 2. 如果当天没有早报，再回退首页 48 小时内热点
+  // 2. 没有当天早报，再回退首页 48 小时热点
   if (!items.length) {
     const homeHtml = await fetchHtml(HOME_URL);
     const $home = cheerio.load(homeHtml);
-    items = extractFallbackNews($home);
+    fallbackItems = extractFallbackNews($home);
+    items = fallbackItems;
     mode = "fallback_news";
   }
 
-  // 3. 没有内容则静默不发群
+  const preview = buildPreviewData({
+    dateText: dateInfo.dateText,
+    mode,
+    items,
+    reportUrl,
+    debug: {
+      reportItemCount: reportItems.length,
+      fallbackItemCount: fallbackItems.length
+    }
+  });
+
+  writePreviewFiles(preview);
+
   if (!items.length) {
     console.log("No news extracted, skip sending");
+    return;
+  }
+
+  if (PREVIEW_ONLY) {
+    console.log("Preview only, skip sending to Feishu");
     return;
   }
 
@@ -399,6 +499,9 @@ async function main() {
     )
   );
 }
+
+
+
 
 main().catch((err) => {
   console.error(err);
