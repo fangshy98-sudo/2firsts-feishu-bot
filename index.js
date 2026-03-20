@@ -629,8 +629,9 @@ function timestampToIsoDate(timestamp) {
     return '';
   }
 
-  return new Date(value * 1000).toISOString().slice(0, 10);
+  return getDateStringInTimeZone(new Date(value * 1000), TIME_ZONE);
 }
+
 
 function getDateStringInTimeZone(date, timeZone) {
   const parts = new Intl.DateTimeFormat('en-CA', {
