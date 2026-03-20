@@ -24,10 +24,15 @@ jobs:
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
 
-
-      - name: Run script
+      - name: Generate preview only
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          PREVIEW_ONLY: "true"
           FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
         run: node index.js
+
+      - name: Upload preview artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2firsts-preview
+          path: preview/
