@@ -11,8 +11,8 @@ const FEISHU_SECRET = process.env.FEISHU_SECRET || "";
 const FEISHU_KEYWORD = process.env.FEISHU_KEYWORD || "2F早报";
 const PREVIEW_ONLY = process.env.PREVIEW_ONLY === "true";
 
-const STOP_SECTION_RE = /^(查看更多|热门资讯|专题报道|特别报道|产品|快讯|厂商|合规|地区资讯)$/;
-const SKIP_LINE_RE = /^(前一天|<前一天|选择日期|全部)$/;
+const STOP_SECTION_RE = /^(查看更多|热门资讯|专题报道|特别报道|产品|快讯|厂商|合规|地区资讯|热门精选|相关推荐|精品原创)$/;
+const SKIP_LINE_RE = /^(前一天|<前一天|选择日期|全部|回到今天)$/;
 
 function nowInShanghai() {
   const now = new Date();
@@ -27,7 +27,8 @@ function nowInShanghai() {
   return {
     dateText: `${year}-${month}-${day}`,
     monthDay: `${month}.${day}`,
-    year
+    year,
+    day
   };
 }
 
@@ -40,7 +41,7 @@ function cleanText(text = "") {
 }
 
 function cleanSourceName(text = "") {
-  return cleanText(text).replace(/[，,;；。]+$/g, "").trim();
+  return cleanText(text).replace(/[，,;；。:：]+$/g, "").trim();
 }
 
 function absoluteUrl(url) {
@@ -77,6 +78,16 @@ function isExternalUrl(url) {
   }
 }
 
+function extractObservedReportDate(text) {
+  const normalized = text.replace(/\r/g, "");
+  const match = normalized.match(/早报\s*\/\s*(\d{2}\.\d{2})\s*\n?\s*(\d{4})/);
+  return match ? `${match[1]} ${match[2]}` : "";
+}
+
+function looksLikeTargetReport(text, dateInfo) {
+  return text.includes("早报") && text.includes(dateInfo.monthDay) && text.includes(dateInfo.year);
+}
+
 async function fetchHtml(url) {
   const res = await fetch(url, {
     headers: {
@@ -89,6 +100,61 @@ async function fetchHtml(url) {
   }
 
   return await res.text();
+}
+
+async function readCalendarState(page) {
+  return page.evaluate(() => {
+    const choose = document.querySelector(".calendar .li.choose");
+    const today = document.querySelector(".calendar .li.today");
+    const header = document.querySelector(".calendar .header span")?.textContent?.replace(/\s+/g, " ").trim() || "";
+
+    return {
+      header,
+      chooseText: choose?.textContent?.trim() || "",
+      chooseClass: choose?.className || "",
+      todayText: today?.textContent?.trim() || "",
+      todayClass: today?.className || ""
+    };
+  });
+}
+
+function calendarHasTodayReport(calendarState, dateInfo) {
+  const chooseMatches =
+    calendarState.chooseText === String(Number(dateInfo.day)) &&
+    calendarState.chooseClass &&
+    !calendarState.chooseClass.includes("other");
+
+  const todayMatches =
+    calendarState.todayText === String(Number(dateInfo.day)) &&
+    calendarState.todayClass &&
+    !calendarState.todayClass.includes("other");
+
+  return chooseMatches || todayMatches;
+}
+
+async function forceLoadTodayReport(page, dateInfo) {
+  const todayButton = page.locator(".calendar .header i", { hasText: "回到今天" });
+  if (await todayButton.count()) {
+    await todayButton.first().click({ force: true }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  const todayCell = page.locator(".calendar .li.today").first();
+  if (await todayCell.count()) {
+    await todayCell.click({ force: true }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  await page.waitForFunction(
+    ({ monthDay, year }) => {
+      const text = document.body?.innerText || "";
+      return text.includes("早报") && text.includes(monthDay) && text.includes(year);
+    },
+    { monthDay: dateInfo.monthDay, year: dateInfo.year },
+    { timeout: 8000 }
+  ).catch(() => {});
 }
 
 async function fetchRenderedReportPage(url, dateInfo) {
@@ -105,23 +171,24 @@ async function fetchRenderedReportPage(url, dateInfo) {
     });
 
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1500);
 
-    // 关键：明确等待页面真正出现目标日期
-    await page.waitForFunction(
-      ({ monthDay, year }) => {
-        const text = document.body?.innerText || "";
-        return text.includes("早报") && text.includes(monthDay) && text.includes(year);
-      },
-      { monthDay: dateInfo.monthDay, year: dateInfo.year },
-      { timeout: 15000 }
-    ).catch(() => {});
+    let calendarState = await readCalendarState(page);
+    let text = await page.locator("body").innerText().catch(() => "");
 
-    await page.waitForTimeout(1000);
+    if (!looksLikeTargetReport(text, dateInfo) && calendarHasTodayReport(calendarState, dateInfo)) {
+      await forceLoadTodayReport(page, dateInfo);
+      calendarState = await readCalendarState(page);
+      text = await page.locator("body").innerText().catch(() => "");
+    }
 
     const html = await page.content();
-    const text = await page.locator("body").innerText().catch(() => "");
 
-    return { html, text };
+    return {
+      html,
+      text,
+      calendarState
+    };
   } finally {
     await browser.close();
   }
@@ -147,32 +214,23 @@ function buildSourceMap($) {
   return sourceMap;
 }
 
-function splitTailSource(text, sourceNames) {
-  const cleaned = cleanText(text);
-
-  for (const sourceName of sourceNames) {
-    if (cleaned === sourceName) {
-      return {
-        title: "",
-        sourceName
-      };
-    }
-
-    if (cleaned.endsWith(` ${sourceName}`)) {
-      return {
-        title: cleanText(cleaned.slice(0, -sourceName.length)),
-        sourceName
-      };
-    }
-  }
-
-  return {
-    title: cleaned,
-    sourceName: ""
-  };
+function looksLikeSourceLine(line) {
+  if (!line) return false;
+  if (line.length > 40) return false;
+  if (/[。；;:：]/.test(line)) return false;
+  if (/^\d{2}-\d{2}$/.test(line)) return false;
+  if (/^\d+天前$/.test(line)) return false;
+  if (/^\d+小时前$/.test(line)) return false;
+  if (STOP_SECTION_RE.test(line)) return false;
+  if (SKIP_LINE_RE.test(line)) return false;
+  return true;
 }
 
-function extractDailyReportFromDetail(renderedText, html, dateInfo) {
+function extractDailyReportFromDetail(renderedText, html, dateInfo, reportUrl) {
+  if (!looksLikeTargetReport(renderedText, dateInfo)) {
+    return [];
+  }
+
   const normalizedText = renderedText.replace(/\r/g, "");
   const lines = normalizedText
     .split("\n")
@@ -190,10 +248,10 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
 
   const $ = cheerio.load(html);
   const sourceMap = buildSourceMap($);
-  const sourceNames = Array.from(sourceMap.keys()).sort((a, b) => b.length - a.length);
-
   const items = [];
+
   let current = null;
+  let expectedNumber = 1;
 
   function pushCurrent() {
     if (!current) return;
@@ -203,36 +261,36 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
       items.push({
         title,
         sourceName: current.sourceName || "链接",
-        sourceUrl: current.sourceUrl || "",
-        url: ""
+        sourceUrl: current.sourceUrl || reportUrl,
+        url: reportUrl
       });
     }
 
     current = null;
   }
 
-  function processContentLine(line) {
+  function appendLineToCurrent(line) {
     if (!current) return;
 
     const normalizedSource = cleanSourceName(line);
 
     if (!current.sourceName && sourceMap.has(normalizedSource)) {
       current.sourceName = normalizedSource;
-      current.sourceUrl = sourceMap.get(normalizedSource) || "";
+      current.sourceUrl = sourceMap.get(normalizedSource) || reportUrl;
       pushCurrent();
+      expectedNumber += 1;
       return;
     }
 
-    const parsed = splitTailSource(line, sourceNames);
-    if (parsed.title) {
-      current.titleParts.push(parsed.title);
+    if (!current.sourceName && looksLikeSourceLine(normalizedSource)) {
+      current.sourceName = normalizedSource;
+      current.sourceUrl = sourceMap.get(normalizedSource) || reportUrl;
+      pushCurrent();
+      expectedNumber += 1;
+      return;
     }
 
-    if (!current.sourceName && parsed.sourceName) {
-      current.sourceName = parsed.sourceName;
-      current.sourceUrl = sourceMap.get(parsed.sourceName) || "";
-      pushCurrent();
-    }
+    current.titleParts.push(line);
   }
 
   for (let i = headerIndex + 1; i < lines.length; i++) {
@@ -243,8 +301,7 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
     if (SKIP_LINE_RE.test(line)) continue;
     if (line === dateInfo.year || line === dateInfo.monthDay) continue;
 
-    const pureNumber = line.match(/^(\d{1,2})$/);
-    if (pureNumber) {
+    if (line === String(expectedNumber)) {
       pushCurrent();
       current = {
         titleParts: [],
@@ -254,8 +311,8 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
       continue;
     }
 
-    const numberedLine = line.match(/^(\d{1,2})\s*(.*)$/);
-    if (numberedLine && line !== dateInfo.year) {
+    const inlineNumber = line.match(/^(\d{1,2})\s*(.*)$/);
+    if (inlineNumber && Number(inlineNumber[1]) === expectedNumber) {
       pushCurrent();
       current = {
         titleParts: [],
@@ -263,14 +320,25 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo) {
         sourceUrl: ""
       };
 
-      const rest = cleanText(numberedLine[2]);
+      const rest = cleanText(inlineNumber[2]);
       if (rest) {
-        processContentLine(rest);
+        appendLineToCurrent(rest);
       }
       continue;
     }
 
-    processContentLine(line);
+    if (!current) {
+      if (items.length > 0) {
+        break;
+      }
+      continue;
+    }
+
+    appendLineToCurrent(line);
+
+    if (items.length >= 10) {
+      break;
+    }
   }
 
   pushCurrent();
@@ -316,11 +384,13 @@ function buildMessage({ dateText, mode, items }) {
 
   items.forEach((item, index) => {
     const linkText =
-      mode === "daily_report" ? (item.sourceName || "链接") : "链接";
+      mode === "daily_report"
+        ? (item.sourceName || "链接")
+        : "链接";
 
     const linkHref =
       mode === "daily_report"
-        ? (item.sourceUrl || HOME_URL)
+        ? (item.sourceUrl || item.url || HOME_URL)
         : (item.url || HOME_URL);
 
     content.push([
@@ -420,7 +490,7 @@ function writePreviewFiles(preview) {
 
     const linkHref =
       preview.mode === "daily_report"
-        ? (item.sourceUrl || HOME_URL)
+        ? (item.sourceUrl || item.url || HOME_URL)
         : (item.url || HOME_URL);
 
     lines.push(`${index + 1}. ${item.title}`);
@@ -433,6 +503,12 @@ function writePreviewFiles(preview) {
   lines.push(`- fallbackItemCount: ${preview.debug.fallbackItemCount}`);
   lines.push(`- reportError: ${preview.debug.reportError || ""}`);
   lines.push(`- fallbackError: ${preview.debug.fallbackError || ""}`);
+  lines.push(`- observedReportDate: ${preview.debug.observedReportDate || ""}`);
+  lines.push(`- calendarHeader: ${preview.debug.calendarHeader || ""}`);
+  lines.push(`- calendarChooseText: ${preview.debug.calendarChooseText || ""}`);
+  lines.push(`- calendarChooseClass: ${preview.debug.calendarChooseClass || ""}`);
+  lines.push(`- calendarTodayText: ${preview.debug.calendarTodayText || ""}`);
+  lines.push(`- calendarTodayClass: ${preview.debug.calendarTodayClass || ""}`);
   lines.push("");
   lines.push("## Report Text Sample");
   lines.push("```text");
@@ -452,13 +528,6 @@ function writePreviewFiles(preview) {
   }
 }
 
-function extractObservedReportDate(text) {
-  const normalized = text.replace(/\r/g, "");
-  const match = normalized.match(/早报\s*\/\s*(\d{2}\.\d{2})\s*\n?\s*(\d{4})/);
-  return match ? `${match[1]} ${match[2]}` : "";
-}
-
-
 async function main() {
   const dateInfo = nowInShanghai();
   const reportUrl = buildReportUrl(dateInfo.dateText);
@@ -471,21 +540,35 @@ async function main() {
   let fallbackError = "";
   let reportTextSample = "";
   let observedReportDate = "";
-  let rendered = null;
+  let calendarHeader = "";
+  let calendarChooseText = "";
+  let calendarChooseClass = "";
+  let calendarTodayText = "";
+  let calendarTodayClass = "";
 
-  // 1. 优先抓当天早报详情页
   try {
-    rendered = await fetchRenderedReportPage(reportUrl, dateInfo);
+    const rendered = await fetchRenderedReportPage(reportUrl, dateInfo);
     reportTextSample = rendered.text.slice(0, 3000);
     observedReportDate = extractObservedReportDate(rendered.text);
-    reportItems = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
+
+    calendarHeader = rendered.calendarState.header || "";
+    calendarChooseText = rendered.calendarState.chooseText || "";
+    calendarChooseClass = rendered.calendarState.chooseClass || "";
+    calendarTodayText = rendered.calendarState.todayText || "";
+    calendarTodayClass = rendered.calendarState.todayClass || "";
+
+    reportItems = extractDailyReportFromDetail(
+      rendered.text,
+      rendered.html,
+      dateInfo,
+      reportUrl
+    );
     items = reportItems;
   } catch (err) {
     reportError = err.message || String(err);
     items = [];
   }
 
-  // 2. 如果当天没有早报，再回退首页 48 小时热点
   if (!items.length) {
     try {
       const homeHtml = await fetchHtml(HOME_URL);
@@ -508,8 +591,13 @@ async function main() {
       fallbackItemCount: fallbackItems.length,
       reportError,
       fallbackError,
-      reportTextSample,
-      observedReportDate
+      observedReportDate,
+      calendarHeader,
+      calendarChooseText,
+      calendarChooseClass,
+      calendarTodayText,
+      calendarTodayClass,
+      reportTextSample
     }
   });
 
@@ -526,29 +614,4 @@ async function main() {
   }
 
   const payload = buildMessage({
-    dateText: dateInfo.dateText,
-    mode,
-    items
-  });
-
-  await sendToFeishu(payload);
-
-  console.log(
-    JSON.stringify(
-      {
-        ok: true,
-        dateText: dateInfo.dateText,
-        mode,
-        count: items.length
-      },
-      null,
-      2
-    )
-  );
-}
-
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+    dateText: dateInfo.dateText
