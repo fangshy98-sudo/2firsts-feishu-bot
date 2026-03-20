@@ -1,0 +1,14 @@
+{
+  "name": "2firsts-feishu-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "test-run": "node index.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  }
+}
