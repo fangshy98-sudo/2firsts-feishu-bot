@@ -1,0 +1,50 @@
+name: Send 2Firsts To Feishu
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: Optional date in YYYY-MM-DD format. Leave blank to use today in Asia/Shanghai.
+        required: false
+        default: ''
+      preview_only:
+        description: true = only generate preview artifact, false = actually send to Feishu
+        required: true
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run sender
+        env:
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+          PREVIEW_ONLY: ${{ github.event.inputs.preview_only }}
+          TIME_ZONE: Asia/Shanghai
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
+        run: node index.js
+
+      - name: Upload preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2firsts-send-preview
+          path: preview/
+          if-no-files-found: warn
