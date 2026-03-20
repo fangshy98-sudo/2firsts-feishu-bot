@@ -471,18 +471,19 @@ async function main() {
   let fallbackError = "";
   let reportTextSample = "";
   let observedReportDate = "";
+  let rendered = null;
 
   // 1. 优先抓当天早报详情页
   try {
-    const rendered = await fetchRenderedReportPage(reportUrl, dateInfo);
+    rendered = await fetchRenderedReportPage(reportUrl, dateInfo);
     reportTextSample = rendered.text.slice(0, 3000);
+    observedReportDate = extractObservedReportDate(rendered.text);
     reportItems = extractDailyReportFromDetail(rendered.text, rendered.html, dateInfo);
     items = reportItems;
   } catch (err) {
     reportError = err.message || String(err);
     items = [];
   }
-  observedReportDate = extractObservedReportDate(rendered.text);
 
   // 2. 如果当天没有早报，再回退首页 48 小时热点
   if (!items.length) {
@@ -502,7 +503,6 @@ async function main() {
     mode,
     items,
     reportUrl,
-
     debug: {
       reportItemCount: reportItems.length,
       fallbackItemCount: fallbackItems.length,
@@ -515,13 +515,11 @@ async function main() {
 
   writePreviewFiles(preview);
 
-  // 3. 没有内容则静默不发群
   if (!items.length) {
     console.log("No news extracted, skip sending");
     return;
   }
 
-  // 4. 预览模式不发飞书
   if (PREVIEW_ONLY) {
     console.log("Preview only, skip sending to Feishu");
     return;
@@ -548,6 +546,7 @@ async function main() {
     )
   );
 }
+
 
 main().catch((err) => {
   console.error(err);
