@@ -104,9 +104,9 @@ async function fetchHtml(url) {
 
 async function readCalendarState(page) {
   return page.evaluate(() => {
+    const header = document.querySelector(".calendar .header")?.textContent?.replace(/\s+/g, " ").trim() || "";
     const choose = document.querySelector(".calendar .li.choose");
     const today = document.querySelector(".calendar .li.today");
-    const header = document.querySelector(".calendar .header span")?.textContent?.replace(/\s+/g, " ").trim() || "";
 
     return {
       header,
@@ -119,13 +119,15 @@ async function readCalendarState(page) {
 }
 
 function calendarHasTodayReport(calendarState, dateInfo) {
+  const dayNumber = String(Number(dateInfo.day));
+
   const chooseMatches =
-    calendarState.chooseText === String(Number(dateInfo.day)) &&
+    calendarState.chooseText === dayNumber &&
     calendarState.chooseClass &&
     !calendarState.chooseClass.includes("other");
 
   const todayMatches =
-    calendarState.todayText === String(Number(dateInfo.day)) &&
+    calendarState.todayText === dayNumber &&
     calendarState.todayClass &&
     !calendarState.todayClass.includes("other");
 
@@ -133,9 +135,9 @@ function calendarHasTodayReport(calendarState, dateInfo) {
 }
 
 async function forceLoadTodayReport(page, dateInfo) {
-  const todayButton = page.locator(".calendar .header i", { hasText: "回到今天" });
-  if (await todayButton.count()) {
-    await todayButton.first().click({ force: true }).catch(() => {});
+  const backToToday = page.locator(".calendar .header i", { hasText: "回到今天" });
+  if (await backToToday.count()) {
+    await backToToday.first().click({ force: true }).catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(1200);
   }
@@ -248,8 +250,8 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo, reportUrl) {
 
   const $ = cheerio.load(html);
   const sourceMap = buildSourceMap($);
-  const items = [];
 
+  const items = [];
   let current = null;
   let expectedNumber = 1;
 
@@ -269,40 +271,63 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo, reportUrl) {
     current = null;
   }
 
-  function appendLineToCurrent(line) {
+  function completeCurrentWithSource(name) {
     if (!current) return;
-
-    const normalizedSource = cleanSourceName(line);
-
-    if (!current.sourceName && sourceMap.has(normalizedSource)) {
-      current.sourceName = normalizedSource;
-      current.sourceUrl = sourceMap.get(normalizedSource) || reportUrl;
-      pushCurrent();
-      expectedNumber += 1;
-      return;
-    }
-
-    if (!current.sourceName && looksLikeSourceLine(normalizedSource)) {
-      current.sourceName = normalizedSource;
-      current.sourceUrl = sourceMap.get(normalizedSource) || reportUrl;
-      pushCurrent();
-      expectedNumber += 1;
-      return;
-    }
-
-    current.titleParts.push(line);
+    current.sourceName = name || "链接";
+    current.sourceUrl = sourceMap.get(name) || reportUrl;
+    pushCurrent();
+    expectedNumber += 1;
   }
 
   for (let i = headerIndex + 1; i < lines.length; i++) {
     const line = lines[i];
 
     if (!line) continue;
-    if (STOP_SECTION_RE.test(line)) break;
-    if (SKIP_LINE_RE.test(line)) continue;
     if (line === dateInfo.year || line === dateInfo.monthDay) continue;
+    if (SKIP_LINE_RE.test(line)) continue;
 
-    if (line === String(expectedNumber)) {
+    if (STOP_SECTION_RE.test(line)) {
       pushCurrent();
+      break;
+    }
+
+    const pureNumber = line.match(/^(\d{1,2})$/);
+    const inlineNumber = line.match(/^(\d{1,2})\s*(.*)$/);
+
+    if (!current) {
+      if (pureNumber && Number(pureNumber[1]) === expectedNumber) {
+        current = {
+          titleParts: [],
+          sourceName: "",
+          sourceUrl: ""
+        };
+        continue;
+      }
+
+      if (inlineNumber && Number(inlineNumber[1]) === expectedNumber) {
+        current = {
+          titleParts: [],
+          sourceName: "",
+          sourceUrl: ""
+        };
+
+        const rest = cleanText(inlineNumber[2]);
+        if (rest) {
+          current.titleParts.push(rest);
+        }
+        continue;
+      }
+
+      if (items.length > 0) {
+        break;
+      }
+
+      continue;
+    }
+
+    if (pureNumber && Number(pureNumber[1]) === expectedNumber + 1) {
+      pushCurrent();
+      expectedNumber += 1;
       current = {
         titleParts: [],
         sourceName: "",
@@ -311,9 +336,9 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo, reportUrl) {
       continue;
     }
 
-    const inlineNumber = line.match(/^(\d{1,2})\s*(.*)$/);
-    if (inlineNumber && Number(inlineNumber[1]) === expectedNumber) {
+    if (inlineNumber && Number(inlineNumber[1]) === expectedNumber + 1) {
       pushCurrent();
+      expectedNumber += 1;
       current = {
         titleParts: [],
         sourceName: "",
@@ -322,23 +347,26 @@ function extractDailyReportFromDetail(renderedText, html, dateInfo, reportUrl) {
 
       const rest = cleanText(inlineNumber[2]);
       if (rest) {
-        appendLineToCurrent(rest);
+        current.titleParts.push(rest);
       }
       continue;
     }
 
-    if (!current) {
-      if (items.length > 0) {
-        break;
-      }
+    const normalizedSource = cleanSourceName(line);
+
+    if (sourceMap.has(normalizedSource)) {
+      completeCurrentWithSource(normalizedSource);
+      if (items.length >= 10) break;
       continue;
     }
 
-    appendLineToCurrent(line);
-
-    if (items.length >= 10) {
-      break;
+    if (looksLikeSourceLine(normalizedSource) && current.titleParts.length > 0) {
+      completeCurrentWithSource(normalizedSource);
+      if (items.length >= 10) break;
+      continue;
     }
+
+    current.titleParts.push(line);
   }
 
   pushCurrent();
@@ -614,4 +642,28 @@ async function main() {
   }
 
   const payload = buildMessage({
-    dateText: dateInfo.dateText
+    dateText: dateInfo.dateText,
+    mode,
+    items
+  });
+
+  await sendToFeishu(payload);
+
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        dateText: dateInfo.dateText,
+        mode,
+        count: items.length
+      },
+      null,
+      2
+    )
+  );
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
