@@ -66,9 +66,11 @@ async function fetchHtml(url) {
 }
 
 function extractDailyReport($, marker) {
-  const target = `早报 / ${marker}`;
   const allNodes = $("body *").toArray();
-  const startIndex = allNodes.findIndex((el) => cleanText($(el).text()) === target);
+  const startIndex = allNodes.findIndex((el) => {
+    const text = cleanText($(el).text());
+    return text.includes("早报") && text.includes(marker);
+  });
 
   if (startIndex === -1) return [];
 
@@ -91,13 +93,9 @@ function extractDailyReport($, marker) {
       const title = cleanText($(link).text());
 
       if (!href.includes("/news/")) continue;
-      if (!title) continue;
-      if (title === "全部") continue;
+      if (!title || title === "全部") continue;
 
-      items.push({
-        title,
-        url: href
-      });
+      items.push({ title, url: href });
     }
 
     if (items.length >= 12) break;
@@ -105,6 +103,7 @@ function extractDailyReport($, marker) {
 
   return uniqueByTitle(items).slice(0, 10);
 }
+
 
 function extractFallbackNews($) {
   const items = [];
@@ -136,37 +135,43 @@ function extractFallbackNews($) {
 }
 
 function buildMessage({ dateText, mode, items }) {
-  const title = mode === "daily_report" ? "今日早报" : "首页近48小时新闻";
-  const lines = [
-    `${FEISHU_KEYWORD}｜${dateText}`,
-    `模式：${title}`,
-    ""
+  const modeText = mode === "daily_report" ? "早报" : "近期热点";
+
+  const content = [
+    [{ tag: "text", text: `${FEISHU_KEYWORD}｜${dateText}` }],
+    [{ tag: "text", text: `模式：${modeText}` }],
+    [{ tag: "text", text: "" }]
   ];
 
   items.forEach((item, index) => {
-    lines.push(`${index + 1}. ${item.title}`);
-    if (item.timeTag) {
-      lines.push(`时间：${item.timeTag}`);
-    }
-    lines.push(`链接：${item.url}`);
-    lines.push("");
+    content.push([
+      { tag: "text", text: `${index + 1}. ${item.title} ` },
+      { tag: "a", text: "链接", href: item.url }
+    ]);
   });
 
-  lines.push(`来源：${HOME_URL}`);
-  return lines.join("\n");
+  content.push([
+    { tag: "text", text: "来源：" },
+    { tag: "a", text: "2Firsts", href: HOME_URL }
+  ]);
+
+  return {
+    msg_type: "post",
+    content: {
+      post: {
+        zh_cn: {
+          title: `${FEISHU_KEYWORD}｜${dateText}`,
+          content
+        }
+      }
+    }
+  };
 }
 
-async function sendToFeishu(text) {
+async function sendToFeishu(payload) {
   if (!FEISHU_WEBHOOK) {
     throw new Error("Missing FEISHU_WEBHOOK");
   }
-
-  const payload = {
-    msg_type: "text",
-    content: {
-      text
-    }
-  };
 
   if (FEISHU_SECRET) {
     const timestamp = String(Math.floor(Date.now() / 1000));
@@ -191,6 +196,7 @@ async function sendToFeishu(text) {
   return data;
 }
 
+
 async function main() {
   const { dateText, reportMarker } = nowInShanghai();
   const html = await fetchHtml(HOME_URL);
@@ -208,13 +214,14 @@ async function main() {
     throw new Error("No news extracted from homepage");
   }
 
-  const message = buildMessage({
-    dateText,
-    mode,
-    items
-  });
+const payload = buildMessage({
+  dateText,
+  mode,
+  items
+});
 
-  await sendToFeishu(message);
+await sendToFeishu(payload);
+
 
   console.log(
     JSON.stringify(
