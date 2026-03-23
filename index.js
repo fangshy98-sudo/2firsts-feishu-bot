@@ -1,695 +1,873 @@
-const fs = require('fs/promises');
-const path = require('path');
-const vm = require('vm');
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
-const SITE = 'https://cn.2firsts.com';
-const HOMEPAGE_URL = `${SITE}/`;
-const REPORT_DETAIL_URL = `${SITE}/report/detail?date=`;
-const CHECK_MONTH_URL = `${SITE}/index.php/api/v2/report/checkMonth?date=`;
-const PREVIEW_DIR = path.join(process.cwd(), 'preview');
-const PREVIEW_JSON = path.join(PREVIEW_DIR, 'latest.json');
-const PREVIEW_MD = path.join(PREVIEW_DIR, 'latest.md');
-const TIME_ZONE = process.env.TIME_ZONE || 'Asia/Shanghai';
-const FALLBACK_HOURS = Number(process.env.FALLBACK_HOURS || 48);
-const FALLBACK_LIMIT = Number(process.env.FALLBACK_LIMIT || 10);
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
-const PREVIEW_ONLY = isTruthy(process.env.PREVIEW_ONLY);
-const TARGET_DATE = process.env.TARGET_DATE || getDateStringInTimeZone(new Date(), TIME_ZONE);
-const FEISHU_WEBHOOK =
-  process.env.FEISHU_WEBHOOK ||
-  process.env.FEISHU_WEBHOOK_URL ||
-  process.env.FEISHU_URL ||
-  '';
-const FEISHU_KEYWORD = (process.env.FEISHU_KEYWORD || '').trim();
+const BASE_URL = "https://cn.2firsts.com/";
+const PREVIEW_DIR = path.join(__dirname, "preview");
+const RUNS_DIR = path.join(PREVIEW_DIR, "runs");
+const HTML_ENTITIES = {
+  amp: "&",
+  apos: "'",
+  gt: ">",
+  lt: "<",
+  nbsp: " ",
+  quot: '"',
+};
+const REPORT_STOP_TITLES = new Set([
+  "推荐阅读",
+  "相关阅读",
+  "热门资讯",
+  "地区资讯",
+  "专题报道",
+  "特别报道",
+  "产品",
+  "快讯",
+  "厂商",
+  "合规",
+]);
+const REPORT_NOISE_PATTERNS = [
+  /^0$/,
+  /^分享$/,
+  /^链接$/,
+  /^保存长图$/,
+  /^前一天$/,
+  /^后一天$/,
+  /^选择日期$/,
+  /^<前一天\s*选择日期$/,
+  /^本网站仅供国际用户访问/, 
+  /^首页$/,
+  /^订阅$/,
+  /^中文站$/,
+  /^英文站/, 
+  /^原创$/,
+  /^中国$/,
+  /^国际$/,
+];
 
-async function main() {
-  const startedAt = new Date().toISOString();
-
-  console.log(`[info] targetDate=${TARGET_DATE}`);
-  console.log(`[info] previewOnly=${PREVIEW_ONLY}`);
-
-  const checkMonthResult = await safeRun(() => fetchCheckMonth(TARGET_DATE));
-  const reportResult = await safeRun(() => fetchDailyReport(TARGET_DATE));
-
-  let finalResult;
-
-  if (reportResult.ok && reportResult.value.reportExists) {
-    finalResult = {
-      ...reportResult.value,
-      diagnostics: {
-        ...reportResult.value.diagnostics,
-        checkMonth: checkMonthResult.ok ? checkMonthResult.value : { ok: false, error: checkMonthResult.error },
-      },
-    };
-  } else {
-    const fallbackResult = await fetchHomepageFallback({
-      targetDate: TARGET_DATE,
-      checkMonth: checkMonthResult.ok ? checkMonthResult.value : null,
-      reportAttempt: reportResult.ok ? reportResult.value : null,
-    });
-
-    finalResult = {
-      ...fallbackResult,
-      diagnostics: {
-        ...fallbackResult.diagnostics,
-        checkMonth: checkMonthResult.ok ? checkMonthResult.value : { ok: false, error: checkMonthResult.error },
-        reportAttempt: reportResult.ok ? reportResult.value.diagnostics : { ok: false, error: reportResult.error },
-      },
-    };
+class RunLogger {
+  constructor() {
+    this.lines = [];
   }
 
-  finalResult.generatedAt = startedAt;
+  write(level, message) {
+    const line = `${new Date().toISOString()} [${level}] ${message}`;
+    this.lines.push(line);
 
-  await writePreview(finalResult);
+    if (level === "ERROR") {
+      console.error(line);
+      return;
+    }
 
-  if (PREVIEW_ONLY) {
-    console.log(`[info] preview written to ${PREVIEW_JSON}`);
-    return;
+    console.log(line);
   }
 
-  if (!FEISHU_WEBHOOK) {
-    console.log('[warn] FEISHU_WEBHOOK is empty, skip sending.');
-    return;
+  info(message) {
+    this.write("INFO", message);
   }
 
-  if (!Array.isArray(finalResult.items) || finalResult.items.length === 0) {
-    console.log('[warn] no items available, skip sending.');
-    return;
+  warn(message) {
+    this.write("WARN", message);
   }
 
-  await sendToFeishu(finalResult);
+  error(message) {
+    this.write("ERROR", message);
+  }
+
+  toString() {
+    return `${this.lines.join("\n")}\n`;
+  }
 }
 
-async function fetchCheckMonth(targetDate) {
-  const monthDate = `${targetDate.slice(0, 7)}-01`;
-  const url = `${CHECK_MONTH_URL}${monthDate}`;
-  const json = await fetchJson(url);
-  const list = Array.isArray(json?.data?.list) ? json.data.list : [];
-  const matched = list.find((item) => timestampToIsoDate(item?.date) === targetDate) || null;
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
 
-  return {
-    ok: true,
-    url,
-    monthDate,
-    exists: Boolean(matched),
-    cache: Boolean(json?.data?.cache),
-    total: list.length,
-    matched: matched
-      ? {
-          id: matched.id || null,
-          title: cleanText(matched.title),
-          date: timestampToIsoDate(matched.date),
+function writeUtf8(filePath, content) {
+  fs.writeFileSync(filePath, content, { encoding: "utf8" });
+}
+
+function writeJson(filePath, value) {
+  writeUtf8(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function cleanEnv(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function envFlag(name, defaultValue = false) {
+  const raw = cleanEnv(process.env[name]);
+  if (!raw) {
+    return defaultValue;
+  }
+
+  return /^(1|true|yes|on)$/i.test(raw);
+}
+
+function getTodayIsoDate(timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone,
+    year: "numeric",
+  }).formatToParts(new Date());
+  const map = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      map[part.type] = part.value;
+    }
+  }
+
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+function normalizeTargetDate(value, timeZone) {
+  const normalized = cleanEnv(value) || getTodayIsoDate(timeZone);
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw new Error(`TARGET_DATE must be YYYY-MM-DD, received "${normalized || "(empty)"}".`);
+  }
+
+  return normalized;
+}
+
+function getRunStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function getCnDateParts(isoDate) {
+  const [year, month, day] = isoDate.split("-");
+  return { day, month, year };
+}
+
+function toCnReportLabel(isoDate) {
+  const { day, month, year } = getCnDateParts(isoDate);
+  return `${month}.${day} ${year}`;
+}
+
+function toCnReportCompactLabel(isoDate) {
+  const { day, month, year } = getCnDateParts(isoDate);
+  return `${month}.${day}${year}`;
+}
+
+function toCnCardDate(isoDate) {
+  const { day, month } = getCnDateParts(isoDate);
+  return `${month}-${day}`;
+}
+
+function collapseWhitespace(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function decodeHtmlEntities(text) {
+  return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity) => {
+    if (entity.startsWith("#")) {
+      const isHex = entity[1].toLowerCase() === "x";
+      const numeric = parseInt(entity.slice(isHex ? 2 : 1), isHex ? 16 : 10);
+
+      if (!Number.isNaN(numeric)) {
+        try {
+          return String.fromCodePoint(numeric);
+        } catch {
+          return match;
         }
-      : null,
-  };
-}
-
-async function fetchDailyReport(targetDate) {
-  const url = `${REPORT_DETAIL_URL}${targetDate}`;
-  const html = await fetchText(url);
-  const nuxt = extractNuxtState(html);
-  const report = nuxt?.data?.[0]?.report || null;
-
-  let reportTitle = '';
-  let reportDate = '';
-  let items = [];
-  let strategy = 'detail_nuxt';
-
-  if (report && report.content) {
-    reportTitle = cleanText(report.title);
-    reportDate = cleanText(report.seo_url);
-    items = normalizeReportItems(report.content);
-  } else {
-    strategy = 'detail_dom_fallback';
-    const domReport = extractReportFromHtml(html);
-    reportTitle = domReport.title;
-    reportDate = domReport.date;
-    items = domReport.items;
-  }
-
-  const reportExists = reportDate === targetDate && items.length > 0;
-
-  return {
-    mode: reportExists ? 'report_detail' : 'report_detail_miss',
-    strategy,
-    requestedDate: targetDate,
-    resolvedDate: reportDate || null,
-    reportExists,
-    title: reportTitle || null,
-    sourceUrl: url,
-    itemCount: items.length,
-    items,
-    diagnostics: {
-      sourceUrl: url,
-      resolvedDate: reportDate || null,
-      reportTitle: reportTitle || null,
-      itemCount: items.length,
-      nuxtFound: Boolean(nuxt),
-    },
-  };
-}
-
-async function fetchHomepageFallback({ targetDate, checkMonth, reportAttempt }) {
-  const html = await fetchText(HOMEPAGE_URL);
-  const nuxt = extractNuxtState(html);
-
-  let items = [];
-  let strategy = 'homepage_nuxt';
-
-  if (nuxt) {
-    items = collectHomepageItemsFromNuxt(nuxt);
-  }
-
-  if (items.length === 0) {
-    strategy = 'homepage_dom_fallback';
-    items = extractHomepageItemsFromHtml(html);
-  }
-
-  const recentItems = pickRecentItems(items, FALLBACK_HOURS, FALLBACK_LIMIT);
-
-  return {
-    mode: 'fallback_news',
-    strategy,
-    requestedDate: targetDate,
-    resolvedDate: null,
-    reportExists: false,
-    title: `2Firsts 近${FALLBACK_HOURS}小时热点`,
-    sourceUrl: HOMEPAGE_URL,
-    itemCount: recentItems.length,
-    items: recentItems,
-    diagnostics: {
-      sourceUrl: HOMEPAGE_URL,
-      itemCountBeforeFilter: items.length,
-      itemCountAfterFilter: recentItems.length,
-      checkMonthExists: Boolean(checkMonth?.exists),
-      reportAttemptResolvedDate: reportAttempt?.resolvedDate || null,
-      reportAttemptItemCount: reportAttempt?.itemCount || 0,
-      fallbackHours: FALLBACK_HOURS,
-      fallbackLimit: FALLBACK_LIMIT,
-      nuxtFound: Boolean(nuxt),
-    },
-  };
-}
-
-function extractNuxtState(html) {
-  const marker = 'window.__NUXT__=';
-  const start = html.indexOf(marker);
-
-  if (start === -1) {
-    return null;
-  }
-
-  const scriptEnd = html.indexOf('</script>', start);
-
-  if (scriptEnd === -1) {
-    return null;
-  }
-
-  const snippet = html.slice(start, scriptEnd).trim();
-  const sandbox = { window: {} };
-
-  try {
-    vm.runInNewContext(snippet, sandbox, { timeout: 3000 });
-    return sandbox.window.__NUXT__ || null;
-  } catch (error) {
-    console.warn(`[warn] failed to evaluate __NUXT__: ${error.message}`);
-    return null;
-  }
-}
-
-function normalizeReportItems(content) {
-  const items = Array.isArray(content) ? content : [];
-
-  return items
-    .map((item, index) => ({
-      index: index + 1,
-      title: cleanText(item?.title),
-      source: cleanText(item?.source),
-      articleUrl: absoluteUrl(item?.link),
-      sourceUrl: null,
-      timestamp: null,
-      timeText: '',
-      summary: '',
-    }))
-    .filter((item) => item.title && item.articleUrl);
-}
-
-function extractReportFromHtml(html) {
-  const titleMatch =
-    html.match(/早报\s*<span[^>]*>\/<\/span>\s*([0-9]{2}\.[0-9]{2})<\/i><i[^>]*>([0-9]{4})/i) || [];
-  const date = titleMatch[1] && titleMatch[2] ? `${titleMatch[2]}-${titleMatch[1].replace('.', '-')}` : '';
-  const title = titleMatch[1] && titleMatch[2] ? `早报 / ${titleMatch[1]} ${titleMatch[2]}` : '';
-  const items = [];
-  const itemRegex =
-    /<a[^>]+href="([^"]+)"[^>]*class="[^"]*\bitem\b[^"]*"[\s\S]*?<div[^>]+class="title"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]+class="source"[^>]*>([\s\S]*?)<\/div>/gi;
-  let match;
-  let index = 0;
-
-  while ((match = itemRegex.exec(html)) !== null) {
-    index += 1;
-    const articleUrl = absoluteUrl(match[1]);
-    const itemTitle = cleanText(stripTags(match[2]));
-    const source = cleanText(stripTags(match[3]));
-
-    if (!itemTitle || !articleUrl.includes('/news/')) {
-      continue;
-    }
-
-    items.push({
-      index,
-      title: itemTitle,
-      source,
-      articleUrl,
-      sourceUrl: null,
-      timestamp: null,
-      timeText: '',
-      summary: '',
-    });
-  }
-
-  return { title, date, items };
-}
-
-function collectHomepageItemsFromNuxt(nuxt) {
-  const collected = [];
-  const visited = new WeakSet();
-
-  function walk(node) {
-    if (!node || typeof node !== 'object') {
-      return;
-    }
-
-    if (visited.has(node)) {
-      return;
-    }
-
-    visited.add(node);
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        walk(item);
       }
-      return;
+
+      return match;
     }
 
-    if (looksLikeNewsObject(node)) {
-      collected.push(normalizeHomepageItem(node));
-    }
-
-    for (const value of Object.values(node)) {
-      walk(value);
-    }
-  }
-
-  walk(nuxt);
-
-  return dedupeItems(collected);
-}
-
-function looksLikeNewsObject(node) {
-  const title = cleanText(node?.title);
-
-  if (!title) {
-    return false;
-  }
-
-  if (Array.isArray(node?.content) && typeof node?.seo_url === 'string') {
-    return false;
-  }
-
-  const link = typeof node?.link === 'string' ? node.link : '';
-  const hasNewsLink = /\/news(\/|$)/.test(link);
-  const hasArticleShape =
-    typeof node?.description === 'string' ||
-    typeof node?.image === 'string' ||
-    typeof node?.share_image === 'string' ||
-    typeof node?.banner === 'string';
-
-  return hasNewsLink || (hasArticleShape && Number.isFinite(Number(node?.id)));
-}
-
-function normalizeHomepageItem(node) {
-  const timestamp = firstNumber(node?.push_time, node?.preview_time, node?.create_time, node?.date);
-  const articleUrl = absoluteUrl(node?.link || buildArticleUrl(node));
-
-  return {
-    index: 0,
-    title: cleanText(node?.title),
-    source: cleanText(node?.source?.title || node?.tag || node?.author?.username || ''),
-    articleUrl,
-    sourceUrl: null,
-    timestamp,
-    timeText: cleanText(node?.date_string || ''),
-    summary: cleanText(node?.description || ''),
-    image: absoluteUrl(node?.image || node?.share_image || ''),
-  };
-}
-
-function buildArticleUrl(node) {
-  if (node?.id) {
-    return `/news/detail?id=${node.id}`;
-  }
-
-  if (typeof node?.seo_url === 'string' && node.seo_url) {
-    return `/news/${node.seo_url}`;
-  }
-
-  return '';
-}
-
-function extractHomepageItemsFromHtml(html) {
-  const items = [];
-  const anchorRegex = /<a[^>]+href="([^"]*\/news[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let match;
-
-  while ((match = anchorRegex.exec(html)) !== null) {
-    const articleUrl = absoluteUrl(match[1]);
-    const block = match[2];
-    const titleMatch =
-      block.match(/<div[^>]+class="[^"]*\btitle\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
-      block.match(/alt="([^"]+)"/i);
-    const timeMatch = block.match(/<span[^>]+class="[^"]*\btime\b[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
-    const title = cleanText(stripTags(titleMatch?.[1] || ''));
-    const timeText = cleanText(stripTags(timeMatch?.[1] || ''));
-
-    if (!title) {
-      continue;
-    }
-
-    items.push({
-      index: 0,
-      title,
-      source: '',
-      articleUrl,
-      sourceUrl: null,
-      timestamp: null,
-      timeText,
-      summary: '',
-    });
-  }
-
-  return dedupeItems(items);
-}
-
-function pickRecentItems(items, hours, limit) {
-  const now = Date.now();
-  const maxAgeMs = hours * 60 * 60 * 1000;
-
-  const sorted = [...items].sort((a, b) => {
-    const aScore = a.timestamp || 0;
-    const bScore = b.timestamp || 0;
-    return bScore - aScore;
+    return Object.prototype.hasOwnProperty.call(HTML_ENTITIES, entity)
+      ? HTML_ENTITIES[entity]
+      : match;
   });
-
-  const recent = sorted.filter((item) => {
-    if (item.timestamp) {
-      return now - item.timestamp * 1000 <= maxAgeMs;
-    }
-
-    return looksRecentByText(item.timeText, hours);
-  });
-
-  const chosen = (recent.length > 0 ? recent : sorted).slice(0, limit);
-
-  return chosen.map((item, index) => ({ ...item, index: index + 1 }));
 }
 
-function looksRecentByText(text, hours) {
-  if (!text) {
-    return false;
+function stripTags(html) {
+  return collapseWhitespace(
+    decodeHtmlEntities(
+      html
+        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<[^>]+>/g, " "),
+    ).replace(/\u00a0/g, " "),
+  );
+}
+
+function truncate(text, maxLength) {
+  if (text.length <= maxLength) {
+    return text;
   }
 
-  const normalized = cleanText(text);
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
 
-  if (/分钟前|刚刚/.test(normalized)) {
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractMetaContent(html, key) {
+  const pattern = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${escapeRegExp(key)}["'][^>]+content=(["'])([\\s\\S]*?)\\1[^>]*>`,
+    "i",
+  );
+  const match = html.match(pattern);
+  return match ? stripTags(match[2]) : "";
+}
+
+function extractTitleTag(html) {
+  const match = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? stripTags(match[1]) : "";
+}
+
+function toAbsoluteUrl(href) {
+  return new URL(href, BASE_URL).href;
+}
+
+function isArticleLink(href) {
+  return href.includes("/news/detail") || /\/news\//.test(href);
+}
+
+function extractDateToken(text) {
+  const matchers = [
+    /\b\d{2}\.\d{2}\s*\d{4}\b/,
+    /\b\d{2}-\d{2}\b/,
+    /\b\d+\s*(分钟前|小时前|天前)\b/,
+  ];
+
+  for (const pattern of matchers) {
+    const match = text.match(pattern);
+    if (match) {
+      return match[0];
+    }
+  }
+
+  return "";
+}
+
+function cleanupTitle(text) {
+  let title = collapseWhitespace(text);
+
+  title = title
+    .replace(/\s+\d{2}\.\d{2}\s*\d{4}\s*$/g, "")
+    .replace(/\s+\d{2}-\d{2}\s*$/g, "")
+    .replace(/\s+\d+\s*(分钟前|小时前|天前)\s*$/g, "")
+    .replace(/\s+(中国|国际|资讯|产品|快讯|厂商)\s+\d{2}-\d{2}\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return truncate(title, 220);
+}
+
+function isNoiseTitle(title) {
+  if (!title || title.length < 8) {
     return true;
   }
 
-  const hourMatch = normalized.match(/(\d+)\s*小时前/);
-
-  if (hourMatch) {
-    return Number(hourMatch[1]) <= hours;
-  }
-
-  return /今天|昨日|昨天/.test(normalized);
+  return /^(首页|中国|国际|订阅|中文站|英文站|分享|链接|保存长图|全部|更多|推荐阅读|温馨提示)$/.test(title);
 }
 
-async function writePreview(result) {
-  await fs.mkdir(PREVIEW_DIR, { recursive: true });
-  await fs.writeFile(PREVIEW_JSON, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
-  await fs.writeFile(PREVIEW_MD, buildPreviewMarkdown(result), 'utf8');
-}
-
-function buildPreviewMarkdown(result) {
-  const title = buildFeishuTitle(result);
-  const lines = [
-    '# 2Firsts Preview',
-    '',
-    `- 目标日期: ${result.requestedDate}`,
-    `- 模式: ${result.mode}`,
-    `- 策略: ${result.strategy}`,
-    `- 标题: ${title}`,
-    `- 条数: ${result.itemCount || 0}`,
-    `- 来源页: ${result.sourceUrl || ''}`,
-    '',
-    '## 内容',
-    '',
-  ];
-
-  if (!result.items || result.items.length === 0) {
-    lines.push('无可用内容。');
-    return `${lines.join('\n')}\n`;
-  }
-
-  for (const item of result.items) {
-    lines.push(`${item.index}. ${item.title}`);
-    lines.push(`[链接](${item.articleUrl || ''})`);
-    lines.push('');
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
-async function sendToFeishu(result) {
-  const payload = buildFeishuPostPayload(result);
-
-  const response = await fetch(FEISHU_WEBHOOK, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-
-  const raw = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`Feishu webhook failed: ${response.status} ${raw}`);
-  }
-
-  console.log('[info] feishu send success');
-}
-
-function buildFeishuPostPayload(result) {
-  const content = [];
-  const title = buildFeishuTitle(result);
-
-  if (FEISHU_KEYWORD) {
-    content.push([{ tag: 'text', text: FEISHU_KEYWORD }]);
-  }
-
-  for (const item of result.items) {
-    content.push([{ tag: 'text', text: `${item.index}. ${item.title}` }]);
-    content.push([{ tag: 'a', text: '链接', href: item.articleUrl }]);
-  }
-
-  return {
-    msg_type: 'post',
-    content: {
-      post: {
-        zh_cn: {
-          title,
-          content,
-        },
-      },
-    },
-  };
-}
-
-function buildFeishuTitle(result) {
-  if (result.mode === 'report_detail') {
-    return `2Firsts 今日早报 ${result.resolvedDate || result.requestedDate}`;
-  }
-
-  return `2Firsts 首页热点新闻 ${result.requestedDate}`;
-}
-
-async function fetchJson(url) {
-  const response = await fetch(url, buildRequestOptions());
-  const raw = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`request failed ${response.status}: ${url}`);
-  }
-
-  return JSON.parse(raw);
-}
-
-async function fetchText(url) {
-  const response = await fetch(url, buildRequestOptions());
-  const raw = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`request failed ${response.status}: ${url}`);
-  }
-
-  return raw;
-}
-
-function buildRequestOptions() {
-  return {
-    headers: {
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'cache-control': 'no-cache',
-      pragma: 'no-cache',
-      'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-    },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  };
-}
-
-function dedupeItems(items) {
+function dedupeBy(items, makeKey) {
   const seen = new Set();
-  const result = [];
+  const output = [];
 
   for (const item of items) {
-    const key = item.articleUrl || item.title;
-
-    if (!key || seen.has(key)) {
+    const key = makeKey(item);
+    if (seen.has(key)) {
       continue;
     }
 
     seen.add(key);
-    result.push(item);
+    output.push(item);
   }
 
-  return result;
+  return output;
 }
 
-function absoluteUrl(url) {
-  if (!url || typeof url !== 'string') {
-    return '';
-  }
+function extractArticleLinks(html) {
+  const pattern = /<a\b[^>]*href=(["'])([^"'#]+)\1[^>]*>([\s\S]*?)<\/a>/gi;
+  const items = [];
+  let match = pattern.exec(html);
 
-  if (/^https?:\/\//i.test(url)) {
-    return url;
-  }
-
-  if (url.startsWith('//')) {
-    return `https:${url}`;
-  }
-
-  if (url.startsWith('/')) {
-    return `${SITE}${url}`;
-  }
-
-  return `${SITE}/${url.replace(/^\.\//, '')}`;
-}
-
-function cleanText(value) {
-  if (value === null || value === undefined) {
-    return '';
-  }
-
-  return htmlDecode(String(value))
-    .replace(/\s+/g, ' ')
-    .replace(/\u00a0/g, ' ')
-    .trim();
-}
-
-function stripTags(value) {
-  return String(value || '').replace(/<[^>]+>/g, ' ');
-}
-
-function htmlDecode(value) {
-  return String(value || '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function timestampToIsoDate(timestamp) {
-  const value = Number(timestamp);
-
-  if (!Number.isFinite(value) || value <= 0) {
-    return '';
-  }
-
-  return getDateStringInTimeZone(new Date(value * 1000), TIME_ZONE);
-}
-
-function getDateStringInTimeZone(date, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(date);
-
-  const partMap = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${partMap.year}-${partMap.month}-${partMap.day}`;
-}
-
-function firstNumber(...values) {
-  for (const value of values) {
-    const number = Number(value);
-
-    if (Number.isFinite(number) && number > 0) {
-      return number;
+  while (match) {
+    const href = match[2].trim();
+    if (!href || !isArticleLink(href)) {
+      match = pattern.exec(html);
+      continue;
     }
+
+    const rawText = stripTags(match[3]);
+    const title = cleanupTitle(rawText);
+    const dateText = extractDateToken(rawText);
+
+    if (!isNoiseTitle(title)) {
+      items.push({
+        dateText,
+        rawText,
+        title,
+        url: toAbsoluteUrl(href),
+      });
+    }
+
+    match = pattern.exec(html);
   }
 
-  return null;
+  return dedupeBy(items, (item) => item.url);
 }
 
-function isTruthy(value) {
-  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+function extractTextBlocks(html) {
+  return [...html.matchAll(/<(p|li|h1|h2|h3|div)\b[^>]*>([\s\S]*?)<\/\1>/gi)]
+    .map((match) => stripTags(match[2]))
+    .filter(Boolean);
 }
 
-async function safeRun(fn) {
+function isReportNoiseBlock(text) {
+  return REPORT_NOISE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isReportStopBlock(text) {
+  return REPORT_STOP_TITLES.has(text);
+}
+
+function findReportHeadingIndex(blocks, isoDate) {
+  const expectedA = `早报/${toCnReportLabel(isoDate)}`.replace(/\s+/g, "");
+  const expectedB = `早报/${toCnReportCompactLabel(isoDate)}`.replace(/\s+/g, "");
+
+  return blocks.findIndex((block) => {
+    const normalized = block.replace(/\s+/g, "");
+    return normalized === expectedA || normalized === expectedB;
+  });
+}
+
+function parseReportItems(blocks, headingIndex) {
+  const items = [];
+  let index = headingIndex + 1;
+
+  while (index < blocks.length) {
+    const current = blocks[index];
+
+    if (isReportStopBlock(current)) {
+      break;
+    }
+
+    if (isReportNoiseBlock(current)) {
+      index += 1;
+      continue;
+    }
+
+    if (/^\d+$/.test(current)) {
+      const rank = Number(current);
+      let title = "";
+      let source = "";
+      let cursor = index + 1;
+
+      while (cursor < blocks.length && isReportNoiseBlock(blocks[cursor])) {
+        cursor += 1;
+      }
+
+      if (cursor < blocks.length && !isReportStopBlock(blocks[cursor]) && !/^\d+$/.test(blocks[cursor])) {
+        title = truncate(blocks[cursor], 260);
+        cursor += 1;
+      }
+
+      while (cursor < blocks.length && isReportNoiseBlock(blocks[cursor])) {
+        cursor += 1;
+      }
+
+      if (
+        cursor < blocks.length &&
+        !isReportStopBlock(blocks[cursor]) &&
+        !/^\d+$/.test(blocks[cursor]) &&
+        blocks[cursor].length <= 60
+      ) {
+        source = blocks[cursor];
+        cursor += 1;
+      }
+
+      if (title) {
+        items.push({
+          index: rank || items.length + 1,
+          source,
+          text: title,
+        });
+      }
+
+      index = cursor;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return items;
+}
+
+async function fetchText(url, logger) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
   try {
-    return { ok: true, value: await fn() };
-  } catch (error) {
-    return { ok: false, error: error.message };
+    logger.info(`Fetching ${url}`);
+    const response = await fetch(url, {
+      headers: {
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+
+    if (!response.ok) {
+      throw new Error(`Request failed with HTTP ${response.status} for ${url}`);
+    }
+
+    return text;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-main().catch(async (error) => {
-  console.error(`[fatal] ${error.stack || error.message}`);
+async function tryFetchCnReport(targetDate, logger) {
+  const reportUrl = `${BASE_URL}report/detail?date=${targetDate}`;
 
-  const failurePayload = {
-    generatedAt: new Date().toISOString(),
-    requestedDate: TARGET_DATE,
-    mode: 'error',
-    strategy: 'fatal',
-    title: null,
-    sourceUrl: '',
-    itemCount: 0,
-    items: [],
-    error: error.message,
+  try {
+    const html = await fetchText(reportUrl, logger);
+    const blocks = extractTextBlocks(html);
+    const headingIndex = findReportHeadingIndex(blocks, targetDate);
+
+    if (headingIndex < 0) {
+      return null;
+    }
+
+    const items = parseReportItems(blocks, headingIndex);
+    if (items.length === 0) {
+      return null;
+    }
+
+    return {
+      heading: blocks[headingIndex],
+      items,
+      title: extractMetaContent(html, "og:title") || extractTitleTag(html) || `早报 / ${toCnReportLabel(targetDate)}`,
+      url: reportUrl,
+    };
+  } catch (error) {
+    logger.warn(`Failed to load Chinese report page for ${targetDate}: ${error.message}`);
+    return null;
+  }
+}
+
+function selectFallbackItems(homeHtml, targetDate, timeZone) {
+  const today = getTodayIsoDate(timeZone);
+  const exactDate = toCnCardDate(targetDate);
+  const candidates = extractArticleLinks(homeHtml);
+  const exactMatches = candidates.filter((item) => item.dateText === exactDate);
+
+  if (exactMatches.length > 0) {
+    return {
+      items: exactMatches.slice(0, 8).map((item, index) => ({
+        dateText: item.dateText,
+        index: index + 1,
+        title: item.title,
+        url: item.url,
+      })),
+      matchStrategy: "homepage_exact_date",
+    };
+  }
+
+  const latestItems = candidates.slice(0, 8).map((item, index) => ({
+    dateText: item.dateText,
+    index: index + 1,
+    title: item.title,
+    url: item.url,
+  }));
+
+  return {
+    items: latestItems,
+    matchStrategy: targetDate === today ? "homepage_latest_today" : "homepage_latest",
+  };
+}
+
+function maskEnvPresence(value) {
+  return cleanEnv(value) ? "present" : "missing";
+}
+
+function resolveWebhookUrl(rawWebhook) {
+  if (!rawWebhook) {
+    return "";
+  }
+
+  if (/^https?:\/\//i.test(rawWebhook)) {
+    return rawWebhook;
+  }
+
+  return `https://open.feishu.cn/open-apis/bot/v2/hook/${rawWebhook}`;
+}
+
+function buildFeishuSignature(secret) {
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const key = `${timestamp}\n${secret}`;
+  const sign = crypto.createHmac("sha256", key).update("").digest("base64");
+  return { sign, timestamp };
+}
+
+function buildReportMessage(keyword, targetDate, report) {
+  const lines = [];
+
+  if (keyword) {
+    lines.push(keyword);
+  }
+
+  lines.push(`2Firsts 中文站早报 ${targetDate}`);
+  lines.push("模式: report_detail");
+  lines.push(`标题: ${report.title}`);
+
+  report.items.slice(0, 8).forEach((item) => {
+    lines.push(`${item.index}. ${item.text}${item.source ? ` [${item.source}]` : ""}`);
+  });
+
+  lines.push(`页面: ${report.url}`);
+  return lines.join("\n");
+}
+
+function buildFallbackMessage(keyword, targetDate, items) {
+  const lines = [];
+
+  if (keyword) {
+    lines.push(keyword);
+  }
+
+  lines.push(`2Firsts 中文站首页资讯 ${targetDate}`);
+  lines.push("模式: fallback_news");
+
+  items.forEach((item) => {
+    lines.push(`${item.index}. ${item.title}`);
+    lines.push(`   ${item.url}`);
+  });
+
+  return lines.join("\n");
+}
+
+async function sendToFeishu({ logger, secret, text, webhook }) {
+  const url = resolveWebhookUrl(webhook);
+
+  if (!url) {
+    return {
+      attempted: false,
+      reason: "FEISHU_WEBHOOK is missing, so no message could be sent.",
+      responseBody: "",
+      responseCode: null,
+      responseMessage: "",
+      status: "failed",
+      success: false,
+    };
+  }
+
+  const payload = {
+    content: { text },
+    msg_type: "text",
   };
 
-  try {
-    await writePreview(failurePayload);
-  } catch (writeError) {
-    console.error(`[fatal] failed to write preview: ${writeError.message}`);
+  if (secret) {
+    Object.assign(payload, buildFeishuSignature(secret));
   }
 
+  logger.info(`Sending Feishu message (textLength=${text.length}, signature=${secret ? "enabled" : "disabled"})`);
+
+  try {
+    const response = await fetch(url, {
+      body: JSON.stringify(payload),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    const body = await response.text();
+    let parsed = null;
+
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = null;
+    }
+
+    const responseCode = parsed && typeof parsed === "object" ? (parsed.code ?? parsed.StatusCode ?? null) : null;
+    const responseMessage = parsed && typeof parsed === "object" ? cleanEnv(parsed.msg || parsed.StatusMessage || "") : "";
+    const success = response.ok && (responseCode === null || Number(responseCode) === 0 || responseMessage === "success");
+
+    return {
+      attempted: true,
+      httpStatus: response.status,
+      reason: success ? "Feishu message sent successfully." : `Feishu API returned HTTP ${response.status}${responseMessage ? ` (${responseMessage})` : ""}.`,
+      responseBody: truncate(body || "", 2000),
+      responseCode,
+      responseMessage,
+      status: success ? "sent" : "failed",
+      success,
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      reason: `Failed to call Feishu webhook: ${error.message}`,
+      responseBody: "",
+      responseCode: null,
+      responseMessage: "",
+      status: "failed",
+      success: false,
+    };
+  }
+}
+
+function buildMarkdown(result) {
+  const lines = [
+    "# 2Firsts CN Daily Run",
+    "",
+    `- targetDate: ${result.targetDate}`,
+    `- targetDateText: ${result.targetDateText}`,
+    `- baseUrl: ${result.baseUrl}`,
+    `- mode: ${result.mode}`,
+    `- matchStrategy: ${result.matchStrategy}`,
+    `- itemCount: ${result.itemCount}`,
+    `- previewOnly: ${result.previewOnly}`,
+    `- status: ${result.status}`,
+    `- sendStatus: ${result.send.status}`,
+    `- sendReason: ${result.send.reason}`,
+    `- webhook: ${result.env.FEISHU_WEBHOOK}`,
+    `- secret: ${result.env.FEISHU_SECRET}`,
+    `- keyword: ${result.env.FEISHU_KEYWORD}`,
+    "",
+    "## Message Preview",
+    "",
+    "```text",
+    result.messageText,
+    "```",
+    "",
+  ];
+
+  if (result.mode === "report_detail" && result.report) {
+    lines.push("## Report Page");
+    lines.push("");
+    lines.push(`- title: ${result.report.title}`);
+    lines.push(`- heading: ${result.report.heading}`);
+    lines.push(`- url: ${result.report.url}`);
+    lines.push("");
+    lines.push("## Extracted Report Items");
+    lines.push("");
+
+    result.report.items.forEach((item) => {
+      lines.push(`${item.index}. ${item.text}${item.source ? ` [${item.source}]` : ""}`);
+    });
+  } else {
+    lines.push("## Extracted Homepage News");
+    lines.push("");
+
+    result.items.forEach((item) => {
+      lines.push(`${item.index}. ${item.title}${item.dateText ? ` (${item.dateText})` : ""}`);
+      lines.push(`   ${item.url}`);
+    });
+  }
+
+  lines.push("");
+  lines.push("## Diagnostics");
+  lines.push("");
+  result.diagnostics.forEach((item, index) => {
+    lines.push(`${index + 1}. ${item}`);
+  });
+  lines.push("");
+
+  return `${lines.join("\n")}\n`;
+}
+
+function finalizeArtifacts({ logger, markdown, result, runStamp }) {
+  ensureDir(PREVIEW_DIR);
+  ensureDir(RUNS_DIR);
+
+  const runBaseName = `run-${runStamp}`;
+  writeJson(path.join(RUNS_DIR, `${runBaseName}.json`), result);
+  writeUtf8(path.join(RUNS_DIR, `${runBaseName}.md`), markdown);
+  writeUtf8(path.join(RUNS_DIR, `${runBaseName}.log`), logger.toString());
+  writeJson(path.join(PREVIEW_DIR, "latest.json"), result);
+  writeUtf8(path.join(PREVIEW_DIR, "latest.md"), markdown);
+  writeUtf8(path.join(PREVIEW_DIR, "latest.log"), logger.toString());
+
+  logger.info(`Artifacts written to ${PREVIEW_DIR}`);
+}
+
+async function run() {
+  ensureDir(PREVIEW_DIR);
+  ensureDir(RUNS_DIR);
+
+  const logger = new RunLogger();
+  const timeZone = cleanEnv(process.env.TIME_ZONE) || "Asia/Shanghai";
+  const targetDate = normalizeTargetDate(process.env.TARGET_DATE, timeZone);
+  const targetDateText = toCnReportLabel(targetDate);
+  const previewOnly = envFlag("PREVIEW_ONLY", false);
+  const feishuWebhook = cleanEnv(process.env.FEISHU_WEBHOOK);
+  const feishuSecret = cleanEnv(process.env.FEISHU_SECRET);
+  const feishuKeyword = cleanEnv(process.env.FEISHU_KEYWORD);
+  const runStamp = getRunStamp();
+
+  logger.info(`BASE_URL=${BASE_URL}`);
+  logger.info(`TARGET_DATE=${targetDate}`);
+  logger.info(`TARGET_DATE_TEXT=${targetDateText}`);
+  logger.info(`PREVIEW_ONLY=${previewOnly}`);
+  logger.info(`TIME_ZONE=${timeZone}`);
+  logger.info(`FEISHU_WEBHOOK=${maskEnvPresence(feishuWebhook)}`);
+  logger.info(`FEISHU_SECRET=${maskEnvPresence(feishuSecret)}`);
+  logger.info(`FEISHU_KEYWORD=${maskEnvPresence(feishuKeyword)}`);
+
+  const report = await tryFetchCnReport(targetDate, logger);
+
+  let mode = "fallback_news";
+  let matchStrategy = "homepage_latest";
+  let items = [];
+
+  if (report) {
+    mode = "report_detail";
+    matchStrategy = "report_detail_page";
+    items = report.items.map((item) => ({
+      index: item.index,
+      source: item.source,
+      text: item.text,
+      type: "report_item",
+    }));
+    logger.info(`Chinese daily report found with ${report.items.length} items.`);
+  } else {
+    logger.warn(`No Chinese daily report found for ${targetDate}; falling back to homepage news.`);
+    const homeHtml = await fetchText(BASE_URL, logger);
+    const fallback = selectFallbackItems(homeHtml, targetDate, timeZone);
+    items = fallback.items;
+    matchStrategy = fallback.matchStrategy;
+    logger.info(`Homepage fallback selected ${items.length} items.`);
+  }
+
+  const messageText =
+    mode === "report_detail"
+      ? buildReportMessage(feishuKeyword, targetDate, report)
+      : buildFallbackMessage(feishuKeyword, targetDate, items);
+
+  logger.info(`Prepared message preview (${messageText.length} chars).`);
+
+  let send = {
+    attempted: false,
+    reason: "PREVIEW_ONLY=true, message was not sent.",
+    responseBody: "",
+    responseCode: null,
+    responseMessage: "",
+    status: "skipped",
+    success: false,
+  };
+
+  if (!previewOnly) {
+    send = await sendToFeishu({
+      logger,
+      secret: feishuSecret,
+      text: messageText,
+      webhook: feishuWebhook,
+    });
+  }
+
+  logger.info(`Send status=${send.status}`);
+  logger.info(`Send reason=${send.reason}`);
+
+  const diagnostics = [
+    "This run now targets https://cn.2firsts.com/ instead of https://www.2firsts.com/.",
+    "The script first tries the Chinese daily report page /report/detail?date=YYYY-MM-DD, then falls back to the Chinese homepage news list.",
+    "This run always writes preview/latest.json, preview/latest.md, and preview/latest.log so you can see the exact extracted content even when Feishu send fails.",
+    "If the bot uses signature verification, FEISHU_SECRET must be configured and passed by GitHub Actions.",
+    "If the bot uses keyword security, FEISHU_KEYWORD is automatically prepended to the message when configured.",
+  ];
+
+  if (!previewOnly && !feishuWebhook) {
+    diagnostics.push("FEISHU_WEBHOOK is missing, so extraction can succeed while sending still fails.");
+  }
+
+  if (!previewOnly && feishuWebhook && !feishuSecret) {
+    diagnostics.push("If your Feishu bot requires signature verification, an empty FEISHU_SECRET can cause the webhook call to fail.");
+  }
+
+  const result = {
+    baseUrl: BASE_URL,
+    createdAt: new Date().toISOString(),
+    diagnostics,
+    env: {
+      FEISHU_KEYWORD: maskEnvPresence(feishuKeyword),
+      FEISHU_SECRET: maskEnvPresence(feishuSecret),
+      FEISHU_WEBHOOK: maskEnvPresence(feishuWebhook),
+      PREVIEW_ONLY: String(previewOnly),
+      TARGET_DATE: targetDate,
+      TIME_ZONE: timeZone,
+    },
+    itemCount: items.length,
+    items,
+    matchStrategy,
+    messageText,
+    mode,
+    previewOnly,
+    report,
+    send,
+    status:
+      previewOnly || send.status === "sent"
+        ? "success"
+        : send.status === "skipped"
+          ? "warning"
+          : "failed",
+    targetDate,
+    targetDateText,
+  };
+
+  const markdown = buildMarkdown(result);
+  finalizeArtifacts({ logger, markdown, result, runStamp });
+
+  if (!previewOnly && !send.success) {
+    process.exitCode = 1;
+  }
+}
+
+run().catch((error) => {
+  const logger = new RunLogger();
+  const runStamp = getRunStamp();
+
+  logger.error(error.stack || error.message);
+
+  const result = {
+    baseUrl: BASE_URL,
+    createdAt: new Date().toISOString(),
+    diagnostics: [
+      "The run failed before extraction or sending could finish.",
+      "Check preview/latest.log for the full stack trace and execution context.",
+    ],
+    env: {
+      FEISHU_KEYWORD: maskEnvPresence(process.env.FEISHU_KEYWORD),
+      FEISHU_SECRET: maskEnvPresence(process.env.FEISHU_SECRET),
+      FEISHU_WEBHOOK: maskEnvPresence(process.env.FEISHU_WEBHOOK),
+      PREVIEW_ONLY: cleanEnv(process.env.PREVIEW_ONLY) || "false",
+      TARGET_DATE: cleanEnv(process.env.TARGET_DATE) || "(auto)",
+      TIME_ZONE: cleanEnv(process.env.TIME_ZONE) || "Asia/Shanghai",
+    },
+    itemCount: 0,
+    items: [],
+    matchStrategy: "none",
+    messageText: "",
+    mode: "failed",
+    previewOnly: envFlag("PREVIEW_ONLY", false),
+    report: null,
+    send: {
+      attempted: false,
+      reason: error.message,
+      responseBody: "",
+      responseCode: null,
+      responseMessage: "",
+      status: "failed",
+      success: false,
+    },
+    status: "failed",
+    targetDate: cleanEnv(process.env.TARGET_DATE) || "(auto)",
+    targetDateText: "",
+  };
+
+  const markdown = buildMarkdown(result);
+  finalizeArtifacts({ logger, markdown, result, runStamp });
   process.exitCode = 1;
 });
