@@ -40,8 +40,26 @@ jobs:
           PREVIEW_ONLY: ${{ github.event.inputs.preview_only || 'false' }}
           TIME_ZONE: Asia/Shanghai
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
         run: node index.js
+
+      - name: Print preview summary
+        if: always()
+        run: |
+          echo "=== preview/latest.log ==="
+          if [ -f preview/latest.log ]; then
+            cat preview/latest.log
+          else
+            echo "preview/latest.log not found"
+          fi
+
+          echo "=== preview/latest.md ==="
+          if [ -f preview/latest.md ]; then
+            cat preview/latest.md
+          else
+            echo "preview/latest.md not found"
+          fi
 
       - name: Upload preview artifact
         if: always()
