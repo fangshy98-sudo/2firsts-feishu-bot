@@ -42,7 +42,7 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
-        run: node index.js
+        run: node report-run.js
 
       - name: Print preview summary
         if: always()
@@ -68,3 +68,4 @@ jobs:
           name: 2firsts-preview
           path: preview/
           if-no-files-found: warn
+
