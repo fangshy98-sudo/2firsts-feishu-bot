@@ -1,10 +1,14 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const vm = require("vm");
 
 const BASE_URL = "https://cn.2firsts.com/";
 const PREVIEW_DIR = path.join(__dirname, "preview");
 const RUNS_DIR = path.join(PREVIEW_DIR, "runs");
+const WINDOW_HOURS = 48;
+const MAX_CANDIDATES = 24;
+const MAX_ITEMS = 8;
 const HTML_ENTITIES = {
   amp: "&",
   apos: "'",
@@ -34,11 +38,11 @@ const REPORT_NOISE_PATTERNS = [
   /^后一天$/,
   /^选择日期$/,
   /^<前一天\s*选择日期$/,
-  /^本网站仅供国际用户访问/, 
+  /^本网站仅供国际用户访问/,
   /^首页$/,
   /^订阅$/,
   /^中文站$/,
-  /^英文站/, 
+  /^英文站/,
   /^原创$/,
   /^中国$/,
   /^国际$/,
@@ -96,20 +100,21 @@ function cleanEnv(value) {
 
 function envFlag(name, defaultValue = false) {
   const raw = cleanEnv(process.env[name]);
-  if (!raw) {
-    return defaultValue;
-  }
-
-  return /^(1|true|yes|on)$/i.test(raw);
+  return raw ? /^(1|true|yes|on)$/i.test(raw) : defaultValue;
 }
 
-function getTodayIsoDate(timeZone) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
+function getFormatterParts(dateInput, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
     day: "2-digit",
+    hour: "2-digit",
+    hour12: false,
+    minute: "2-digit",
     month: "2-digit",
+    second: "2-digit",
     timeZone,
     year: "numeric",
-  }).formatToParts(new Date());
+  });
+  const parts = formatter.formatToParts(new Date(dateInput));
   const map = {};
 
   for (const part of parts) {
@@ -118,7 +123,12 @@ function getTodayIsoDate(timeZone) {
     }
   }
 
-  return `${map.year}-${map.month}-${map.day}`;
+  return map;
+}
+
+function getTodayIsoDate(timeZone) {
+  const parts = getFormatterParts(Date.now(), timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function normalizeTargetDate(value, timeZone) {
@@ -129,6 +139,20 @@ function normalizeTargetDate(value, timeZone) {
   }
 
   return normalized;
+}
+
+function getReferenceTimestamp(targetDate, timeZone) {
+  const today = getTodayIsoDate(timeZone);
+
+  if (targetDate === today) {
+    return Date.now();
+  }
+
+  if (timeZone === "Asia/Shanghai") {
+    return Date.parse(`${targetDate}T23:59:59+08:00`);
+  }
+
+  return Date.parse(`${targetDate}T23:59:59Z`);
 }
 
 function getRunStamp() {
@@ -148,11 +172,6 @@ function toCnReportLabel(isoDate) {
 function toCnReportCompactLabel(isoDate) {
   const { day, month, year } = getCnDateParts(isoDate);
   return `${month}.${day}${year}`;
-}
-
-function toCnCardDate(isoDate) {
-  const { day, month } = getCnDateParts(isoDate);
-  return `${month}-${day}`;
 }
 
 function collapseWhitespace(text) {
@@ -221,42 +240,11 @@ function extractTitleTag(html) {
 }
 
 function toAbsoluteUrl(href) {
-  return new URL(href, BASE_URL).href;
+  return new URL(decodeHtmlEntities(href), BASE_URL).href;
 }
 
 function isArticleLink(href) {
   return href.includes("/news/detail") || /\/news\//.test(href);
-}
-
-function extractDateToken(text) {
-  const matchers = [
-    /\b\d{2}\.\d{2}\s*\d{4}\b/,
-    /\b\d{2}-\d{2}\b/,
-    /\b\d+\s*(分钟前|小时前|天前)\b/,
-  ];
-
-  for (const pattern of matchers) {
-    const match = text.match(pattern);
-    if (match) {
-      return match[0];
-    }
-  }
-
-  return "";
-}
-
-function cleanupTitle(text) {
-  let title = collapseWhitespace(text);
-
-  title = title
-    .replace(/\s+\d{2}\.\d{2}\s*\d{4}\s*$/g, "")
-    .replace(/\s+\d{2}-\d{2}\s*$/g, "")
-    .replace(/\s+\d+\s*(分钟前|小时前|天前)\s*$/g, "")
-    .replace(/\s+(中国|国际|资讯|产品|快讯|厂商)\s+\d{2}-\d{2}\s*$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return truncate(title, 220);
 }
 
 function isNoiseTitle(title) {
@@ -264,7 +252,13 @@ function isNoiseTitle(title) {
     return true;
   }
 
-  return /^(首页|中国|国际|订阅|中文站|英文站|分享|链接|保存长图|全部|更多|推荐阅读|温馨提示)$/.test(title);
+  return /^(首页|中国|国际|订阅|中文站|英文站|分享|链接|保存长图|全部|更多|推荐阅读|温馨提示)$/.test(
+    title,
+  );
+}
+
+function cleanupTitle(text) {
+  return truncate(collapseWhitespace(text), 220);
 }
 
 function dedupeBy(items, makeKey) {
@@ -284,35 +278,31 @@ function dedupeBy(items, makeKey) {
   return output;
 }
 
-function extractArticleLinks(html) {
+function extractArticleCandidates(homeHtml) {
   const pattern = /<a\b[^>]*href=(["'])([^"'#]+)\1[^>]*>([\s\S]*?)<\/a>/gi;
   const items = [];
-  let match = pattern.exec(html);
+  let match = pattern.exec(homeHtml);
 
   while (match) {
     const href = match[2].trim();
     if (!href || !isArticleLink(href)) {
-      match = pattern.exec(html);
+      match = pattern.exec(homeHtml);
       continue;
     }
 
-    const rawText = stripTags(match[3]);
-    const title = cleanupTitle(rawText);
-    const dateText = extractDateToken(rawText);
-
+    const title = cleanupTitle(stripTags(match[3]));
     if (!isNoiseTitle(title)) {
       items.push({
-        dateText,
-        rawText,
+        homepageText: stripTags(match[3]),
         title,
         url: toAbsoluteUrl(href),
       });
     }
 
-    match = pattern.exec(html);
+    match = pattern.exec(homeHtml);
   }
 
-  return dedupeBy(items, (item) => item.url);
+  return dedupeBy(items, (item) => item.url).slice(0, MAX_CANDIDATES);
 }
 
 function extractTextBlocks(html) {
@@ -339,67 +329,51 @@ function findReportHeadingIndex(blocks, isoDate) {
   });
 }
 
-function parseReportItems(blocks, headingIndex) {
-  const items = [];
-  let index = headingIndex + 1;
+function extractNuxtState(html) {
+  const match =
+    html.match(/<script>window\.__NUXT__=([\s\S]*?)<\/script>/) ||
+    html.match(/<script>__NUXT__=([\s\S]*?)<\/script>/);
 
-  while (index < blocks.length) {
-    const current = blocks[index];
-
-    if (isReportStopBlock(current)) {
-      break;
-    }
-
-    if (isReportNoiseBlock(current)) {
-      index += 1;
-      continue;
-    }
-
-    if (/^\d+$/.test(current)) {
-      const rank = Number(current);
-      let title = "";
-      let source = "";
-      let cursor = index + 1;
-
-      while (cursor < blocks.length && isReportNoiseBlock(blocks[cursor])) {
-        cursor += 1;
-      }
-
-      if (cursor < blocks.length && !isReportStopBlock(blocks[cursor]) && !/^\d+$/.test(blocks[cursor])) {
-        title = truncate(blocks[cursor], 260);
-        cursor += 1;
-      }
-
-      while (cursor < blocks.length && isReportNoiseBlock(blocks[cursor])) {
-        cursor += 1;
-      }
-
-      if (
-        cursor < blocks.length &&
-        !isReportStopBlock(blocks[cursor]) &&
-        !/^\d+$/.test(blocks[cursor]) &&
-        blocks[cursor].length <= 60
-      ) {
-        source = blocks[cursor];
-        cursor += 1;
-      }
-
-      if (title) {
-        items.push({
-          index: rank || items.length + 1,
-          source,
-          text: title,
-        });
-      }
-
-      index = cursor;
-      continue;
-    }
-
-    index += 1;
+  if (!match) {
+    return null;
   }
 
-  return items;
+  const source = match[0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+  const context = { window: {} };
+
+  vm.createContext(context);
+  vm.runInContext(source, context, { timeout: 5000 });
+  return context.window.__NUXT__ || context.__NUXT__ || null;
+}
+
+function parsePublishedAtFallback(text, timeZone) {
+  const match = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2})[:：](\d{2}))?/);
+
+  if (!match) {
+    return null;
+  }
+
+  const year = match[1];
+  const month = String(match[2]).padStart(2, "0");
+  const day = String(match[3]).padStart(2, "0");
+  const hour = String(match[4] || "12").padStart(2, "0");
+  const minute = String(match[5] || "00").padStart(2, "0");
+
+  if (timeZone === "Asia/Shanghai") {
+    return Date.parse(`${year}-${month}-${day}T${hour}:${minute}:00+08:00`);
+  }
+
+  return Date.parse(`${year}-${month}-${day}T${hour}:${minute}:00Z`);
+}
+
+function formatDateBare(timestamp, timeZone) {
+  const parts = getFormatterParts(timestamp, timeZone);
+  return `${Number(parts.year)}-${Number(parts.month)}-${Number(parts.day)}`;
+}
+
+function formatDateTimeText(timestamp, timeZone) {
+  const parts = getFormatterParts(timestamp, timeZone);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
 async function fetchText(url, logger) {
@@ -431,7 +405,7 @@ async function fetchText(url, logger) {
   }
 }
 
-async function tryFetchCnReport(targetDate, logger) {
+async function detectCnReport(targetDate, logger) {
   const reportUrl = `${BASE_URL}report/detail?date=${targetDate}`;
 
   try {
@@ -443,14 +417,8 @@ async function tryFetchCnReport(targetDate, logger) {
       return null;
     }
 
-    const items = parseReportItems(blocks, headingIndex);
-    if (items.length === 0) {
-      return null;
-    }
-
     return {
       heading: blocks[headingIndex],
-      items,
       title: extractMetaContent(html, "og:title") || extractTitleTag(html) || `早报 / ${toCnReportLabel(targetDate)}`,
       url: reportUrl,
     };
@@ -460,34 +428,109 @@ async function tryFetchCnReport(targetDate, logger) {
   }
 }
 
-function selectFallbackItems(homeHtml, targetDate, timeZone) {
-  const today = getTodayIsoDate(timeZone);
-  const exactDate = toCnCardDate(targetDate);
-  const candidates = extractArticleLinks(homeHtml);
-  const exactMatches = candidates.filter((item) => item.dateText === exactDate);
-
-  if (exactMatches.length > 0) {
-    return {
-      items: exactMatches.slice(0, 8).map((item, index) => ({
-        dateText: item.dateText,
-        index: index + 1,
-        title: item.title,
-        url: item.url,
-      })),
-      matchStrategy: "homepage_exact_date",
-    };
+async function fetchArticleDetail(url, logger, cache, timeZone) {
+  if (cache.has(url)) {
+    return cache.get(url);
   }
 
-  const latestItems = candidates.slice(0, 8).map((item, index) => ({
-    dateText: item.dateText,
-    index: index + 1,
-    title: item.title,
-    url: item.url,
-  }));
+  const promise = (async () => {
+    const html = await fetchText(url, logger);
+    const nuxt = extractNuxtState(html);
+    const article = nuxt?.data?.[0]?.article || null;
+    const rawTitle = article?.title || extractMetaContent(html, "og:title") || extractTitleTag(html);
+    const publishedSeconds = Number(
+      article?.push_time || article?.create_time || article?.preview_time || 0,
+    );
+    const publishedAt =
+      publishedSeconds > 0
+        ? publishedSeconds * 1000
+        : parsePublishedAtFallback(stripTags(article?.content || html), timeZone);
+    const canonicalUrl =
+      article?.seo_url && !article.seo_url.startsWith("http")
+        ? new URL(`news/${article.seo_url}`, BASE_URL).href
+        : article?.link
+          ? toAbsoluteUrl(article.link)
+          : url;
+
+    return {
+      id: article?.id || "",
+      publishedAt,
+      publishedAtDateTimeText: publishedAt ? formatDateTimeText(publishedAt, timeZone) : "",
+      publishedAtText: publishedAt ? formatDateBare(publishedAt, timeZone) : "",
+      source: cleanEnv(article?.source?.title || ""),
+      title: cleanupTitle(rawTitle),
+      url: canonicalUrl,
+    };
+  })().catch((error) => {
+    logger.warn(`Failed to parse article detail ${url}: ${error.message}`);
+    return null;
+  });
+
+  cache.set(url, promise);
+  return promise;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  async function runWorker() {
+    while (cursor < items.length) {
+      const currentIndex = cursor;
+      cursor += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => runWorker()),
+  );
+
+  return results;
+}
+
+async function collectRecentArticles(homeHtml, referenceTimestamp, timeZone, logger) {
+  const candidates = extractArticleCandidates(homeHtml);
+  const detailCache = new Map();
+  const cutoffTimestamp = referenceTimestamp - WINDOW_HOURS * 60 * 60 * 1000;
+
+  logger.info(`Homepage candidates discovered: ${candidates.length}`);
+  logger.info(
+    `Rolling window: ${formatDateTimeText(cutoffTimestamp, timeZone)} -> ${formatDateTimeText(
+      referenceTimestamp,
+      timeZone,
+    )}`,
+  );
+
+  const details = await mapWithConcurrency(candidates, 4, async (candidate) =>
+    fetchArticleDetail(candidate.url, logger, detailCache, timeZone),
+  );
+
+  const recentItems = dedupeBy(
+    details
+      .filter(Boolean)
+      .filter(
+        (item) =>
+          typeof item.publishedAt === "number" &&
+          item.publishedAt >= cutoffTimestamp &&
+          item.publishedAt <= referenceTimestamp,
+      )
+      .sort((left, right) => right.publishedAt - left.publishedAt),
+    (item) => item.id || item.url,
+  ).slice(0, MAX_ITEMS);
 
   return {
-    items: latestItems,
-    matchStrategy: targetDate === today ? "homepage_latest_today" : "homepage_latest",
+    cutoffTimestamp,
+    inspectedCount: details.filter(Boolean).length,
+    items: recentItems.map((item, index) => ({
+      index: index + 1,
+      publishedAt: item.publishedAt,
+      publishedAtDateTimeText: item.publishedAtDateTimeText,
+      publishedAtText: item.publishedAtText,
+      source: item.source,
+      title: item.title,
+      url: item.url,
+    })),
   };
 }
 
@@ -514,44 +557,80 @@ function buildFeishuSignature(secret) {
   return { sign, timestamp };
 }
 
-function buildReportMessage(keyword, targetDate, report) {
-  const lines = [];
-
-  if (keyword) {
-    lines.push(keyword);
-  }
-
-  lines.push(`2Firsts 中文站早报 ${targetDate}`);
-  lines.push("模式: report_detail");
-  lines.push(`标题: ${report.title}`);
-
-  report.items.slice(0, 8).forEach((item) => {
-    lines.push(`${item.index}. ${item.text}${item.source ? ` [${item.source}]` : ""}`);
-  });
-
-  lines.push(`页面: ${report.url}`);
-  return lines.join("\n");
+function buildHeaderName(keyword) {
+  return cleanEnv(keyword) || "2F早报";
 }
 
-function buildFallbackMessage(keyword, targetDate, items) {
-  const lines = [];
+function buildPlainMessage(headerName, targetDate, displayMode, items) {
+  const lines = [headerName, `｜${targetDate}`, `模式：${displayMode}`];
 
-  if (keyword) {
-    lines.push(keyword);
+  if (items.length === 0) {
+    lines.push(`最近${WINDOW_HOURS}小时内暂无新发布文章`);
+    return lines.join("\n");
   }
 
-  lines.push(`2Firsts 中文站首页资讯 ${targetDate}`);
-  lines.push("模式: fallback_news");
-
-  items.forEach((item) => {
-    lines.push(`${item.index}. ${item.title}`);
-    lines.push(`   ${item.url}`);
+  items.forEach((item, index) => {
+    lines.push(`${index + 1}. ${item.title} - ${item.publishedAtText} - 查看原文`);
   });
 
   return lines.join("\n");
 }
 
-async function sendToFeishu({ logger, secret, text, webhook }) {
+function buildMarkdownMessage(headerName, targetDate, displayMode, items) {
+  const lines = [headerName, `｜${targetDate}`, `模式：${displayMode}`, ""];
+
+  if (items.length === 0) {
+    lines.push(`最近${WINDOW_HOURS}小时内暂无新发布文章`);
+    return `${lines.join("\n")}\n`;
+  }
+
+  items.forEach((item, index) => {
+    lines.push(
+      `${index + 1}. ${item.title} - ${item.publishedAtText} - [查看原文](${item.url})`,
+    );
+  });
+
+  return `${lines.join("\n")}\n`;
+}
+
+function buildFeishuPostPayload(headerName, targetDate, displayMode, items) {
+  const content = [
+    [{ tag: "text", text: `｜${targetDate}` }],
+    [{ tag: "text", text: `模式：${displayMode}` }],
+  ];
+
+  if (items.length === 0) {
+    content.push([{ tag: "text", text: `最近${WINDOW_HOURS}小时内暂无新发布文章` }]);
+  } else {
+    items.forEach((item, index) => {
+      content.push([
+        {
+          tag: "text",
+          text: `${index + 1}. ${item.title} - ${item.publishedAtText} - `,
+        },
+        {
+          tag: "a",
+          text: "查看原文",
+          href: item.url,
+        },
+      ]);
+    });
+  }
+
+  return {
+    content: {
+      post: {
+        zh_cn: {
+          content,
+          title: headerName,
+        },
+      },
+    },
+    msg_type: "post",
+  };
+}
+
+async function sendToFeishu({ logger, payload, secret, webhook }) {
   const url = resolveWebhookUrl(webhook);
 
   if (!url) {
@@ -566,20 +645,20 @@ async function sendToFeishu({ logger, secret, text, webhook }) {
     };
   }
 
-  const payload = {
-    content: { text },
-    msg_type: "text",
-  };
-
+  const finalPayload = { ...payload };
   if (secret) {
-    Object.assign(payload, buildFeishuSignature(secret));
+    Object.assign(finalPayload, buildFeishuSignature(secret));
   }
 
-  logger.info(`Sending Feishu message (textLength=${text.length}, signature=${secret ? "enabled" : "disabled"})`);
+  logger.info(
+    `Sending Feishu ${finalPayload.msg_type} message (rows=${
+      finalPayload.content?.post?.zh_cn?.content?.length || 0
+    }, signature=${secret ? "enabled" : "disabled"})`,
+  );
 
   try {
     const response = await fetch(url, {
-      body: JSON.stringify(payload),
+      body: JSON.stringify(finalPayload),
       headers: { "content-type": "application/json" },
       method: "POST",
     });
@@ -592,14 +671,24 @@ async function sendToFeishu({ logger, secret, text, webhook }) {
       parsed = null;
     }
 
-    const responseCode = parsed && typeof parsed === "object" ? (parsed.code ?? parsed.StatusCode ?? null) : null;
-    const responseMessage = parsed && typeof parsed === "object" ? cleanEnv(parsed.msg || parsed.StatusMessage || "") : "";
-    const success = response.ok && (responseCode === null || Number(responseCode) === 0 || responseMessage === "success");
+    const responseCode =
+      parsed && typeof parsed === "object" ? parsed.code ?? parsed.StatusCode ?? null : null;
+    const responseMessage =
+      parsed && typeof parsed === "object"
+        ? cleanEnv(parsed.msg || parsed.StatusMessage || "")
+        : "";
+    const success =
+      response.ok &&
+      (responseCode === null || Number(responseCode) === 0 || responseMessage === "success");
 
     return {
       attempted: true,
       httpStatus: response.status,
-      reason: success ? "Feishu message sent successfully." : `Feishu API returned HTTP ${response.status}${responseMessage ? ` (${responseMessage})` : ""}.`,
+      reason: success
+        ? "Feishu message sent successfully."
+        : `Feishu API returned HTTP ${response.status}${
+            responseMessage ? ` (${responseMessage})` : ""
+          }.`,
       responseBody: truncate(body || "", 2000),
       responseCode,
       responseMessage,
@@ -627,7 +716,12 @@ function buildMarkdown(result) {
     `- targetDateText: ${result.targetDateText}`,
     `- baseUrl: ${result.baseUrl}`,
     `- mode: ${result.mode}`,
+    `- displayMode: ${result.displayMode}`,
     `- matchStrategy: ${result.matchStrategy}`,
+    `- referenceTime: ${result.referenceTimeText}`,
+    `- windowHours: ${result.windowHours}`,
+    `- windowStart: ${result.windowStartText}`,
+    `- windowEnd: ${result.windowEndText}`,
     `- itemCount: ${result.itemCount}`,
     `- previewOnly: ${result.previewOnly}`,
     `- status: ${result.status}`,
@@ -639,32 +733,30 @@ function buildMarkdown(result) {
     "",
     "## Message Preview",
     "",
-    "```text",
-    result.messageText,
-    "```",
-    "",
+    result.messageMarkdown,
   ];
 
-  if (result.mode === "report_detail" && result.report) {
-    lines.push("## Report Page");
+  if (result.report) {
+    lines.push("## Report Marker");
     lines.push("");
     lines.push(`- title: ${result.report.title}`);
     lines.push(`- heading: ${result.report.heading}`);
     lines.push(`- url: ${result.report.url}`);
     lines.push("");
-    lines.push("## Extracted Report Items");
-    lines.push("");
+  }
 
-    result.report.items.forEach((item) => {
-      lines.push(`${item.index}. ${item.text}${item.source ? ` [${item.source}]` : ""}`);
-    });
+  lines.push("## Extracted Articles");
+  lines.push("");
+
+  if (result.items.length === 0) {
+    lines.push(`最近${WINDOW_HOURS}小时内暂无新发布文章`);
   } else {
-    lines.push("## Extracted Homepage News");
-    lines.push("");
-
-    result.items.forEach((item) => {
-      lines.push(`${item.index}. ${item.title}${item.dateText ? ` (${item.dateText})` : ""}`);
-      lines.push(`   ${item.url}`);
+    result.items.forEach((item, index) => {
+      lines.push(
+        `${index + 1}. ${item.title} - ${item.publishedAtText}${
+          item.source ? ` - ${item.source}` : ""
+        } - [查看原文](${item.url})`,
+      );
     });
   }
 
@@ -702,52 +794,45 @@ async function run() {
   const timeZone = cleanEnv(process.env.TIME_ZONE) || "Asia/Shanghai";
   const targetDate = normalizeTargetDate(process.env.TARGET_DATE, timeZone);
   const targetDateText = toCnReportLabel(targetDate);
+  const referenceTimestamp = getReferenceTimestamp(targetDate, timeZone);
   const previewOnly = envFlag("PREVIEW_ONLY", false);
   const feishuWebhook = cleanEnv(process.env.FEISHU_WEBHOOK);
   const feishuSecret = cleanEnv(process.env.FEISHU_SECRET);
   const feishuKeyword = cleanEnv(process.env.FEISHU_KEYWORD);
+  const headerName = buildHeaderName(feishuKeyword);
   const runStamp = getRunStamp();
 
   logger.info(`BASE_URL=${BASE_URL}`);
   logger.info(`TARGET_DATE=${targetDate}`);
   logger.info(`TARGET_DATE_TEXT=${targetDateText}`);
+  logger.info(`REFERENCE_TIME=${formatDateTimeText(referenceTimestamp, timeZone)}`);
   logger.info(`PREVIEW_ONLY=${previewOnly}`);
   logger.info(`TIME_ZONE=${timeZone}`);
   logger.info(`FEISHU_WEBHOOK=${maskEnvPresence(feishuWebhook)}`);
   logger.info(`FEISHU_SECRET=${maskEnvPresence(feishuSecret)}`);
   logger.info(`FEISHU_KEYWORD=${maskEnvPresence(feishuKeyword)}`);
 
-  const report = await tryFetchCnReport(targetDate, logger);
+  const report = await detectCnReport(targetDate, logger);
+  const homeHtml = await fetchText(BASE_URL, logger);
+  const recent = await collectRecentArticles(homeHtml, referenceTimestamp, timeZone, logger);
+  const mode = report ? "morning_report" : "recent_hot";
+  const displayMode = report ? "早报" : "近期热点";
+  const matchStrategy = recent.items.length > 0 ? "latest_48h" : "latest_48h_empty";
+  const messageText = buildPlainMessage(headerName, targetDate, displayMode, recent.items);
+  const messageMarkdown = buildMarkdownMessage(
+    headerName,
+    targetDate,
+    displayMode,
+    recent.items,
+  );
+  const feishuPayload = buildFeishuPostPayload(
+    headerName,
+    targetDate,
+    displayMode,
+    recent.items,
+  );
 
-  let mode = "fallback_news";
-  let matchStrategy = "homepage_latest";
-  let items = [];
-
-  if (report) {
-    mode = "report_detail";
-    matchStrategy = "report_detail_page";
-    items = report.items.map((item) => ({
-      index: item.index,
-      source: item.source,
-      text: item.text,
-      type: "report_item",
-    }));
-    logger.info(`Chinese daily report found with ${report.items.length} items.`);
-  } else {
-    logger.warn(`No Chinese daily report found for ${targetDate}; falling back to homepage news.`);
-    const homeHtml = await fetchText(BASE_URL, logger);
-    const fallback = selectFallbackItems(homeHtml, targetDate, timeZone);
-    items = fallback.items;
-    matchStrategy = fallback.matchStrategy;
-    logger.info(`Homepage fallback selected ${items.length} items.`);
-  }
-
-  const messageText =
-    mode === "report_detail"
-      ? buildReportMessage(feishuKeyword, targetDate, report)
-      : buildFallbackMessage(feishuKeyword, targetDate, items);
-
-  logger.info(`Prepared message preview (${messageText.length} chars).`);
+  logger.info(`Recent article count within ${WINDOW_HOURS} hours: ${recent.items.length}`);
 
   let send = {
     attempted: false,
@@ -762,8 +847,8 @@ async function run() {
   if (!previewOnly) {
     send = await sendToFeishu({
       logger,
+      payload: feishuPayload,
       secret: feishuSecret,
-      text: messageText,
       webhook: feishuWebhook,
     });
   }
@@ -772,25 +857,32 @@ async function run() {
   logger.info(`Send reason=${send.reason}`);
 
   const diagnostics = [
-    "This run now targets https://cn.2firsts.com/ instead of https://www.2firsts.com/.",
-    "The script first tries the Chinese daily report page /report/detail?date=YYYY-MM-DD, then falls back to the Chinese homepage news list.",
-    "This run always writes preview/latest.json, preview/latest.md, and preview/latest.log so you can see the exact extracted content even when Feishu send fails.",
-    "If the bot uses signature verification, FEISHU_SECRET must be configured and passed by GitHub Actions.",
-    "If the bot uses keyword security, FEISHU_KEYWORD is automatically prepended to the message when configured.",
+    "Content now comes from articles published within the latest 48 hours of the reference time, not from 'today/homepage latest' ordering.",
+    "Mode label only controls whether the run is tagged as 早报 or 近期热点; the pushed item list always comes from the rolling 48-hour article window.",
+    "The script checks /report/detail?date=YYYY-MM-DD to decide whether to label the run as 早报.",
+    "Each pushed item now includes the 2Firsts publish date and is sent as a Feishu rich-text post with a clickable '查看原文' link.",
+    "This run always writes preview/latest.json, preview/latest.md, and preview/latest.log so you can inspect extracted items even when Feishu sending fails.",
   ];
+
+  if (recent.items.length === 0) {
+    diagnostics.push(`No articles were found inside the last ${WINDOW_HOURS} hours.`);
+  }
 
   if (!previewOnly && !feishuWebhook) {
     diagnostics.push("FEISHU_WEBHOOK is missing, so extraction can succeed while sending still fails.");
   }
 
   if (!previewOnly && feishuWebhook && !feishuSecret) {
-    diagnostics.push("If your Feishu bot requires signature verification, an empty FEISHU_SECRET can cause the webhook call to fail.");
+    diagnostics.push(
+      "If your Feishu bot requires signature verification, an empty FEISHU_SECRET can cause the webhook call to fail.",
+    );
   }
 
   const result = {
     baseUrl: BASE_URL,
     createdAt: new Date().toISOString(),
     diagnostics,
+    displayMode,
     env: {
       FEISHU_KEYWORD: maskEnvPresence(feishuKeyword),
       FEISHU_SECRET: maskEnvPresence(feishuSecret),
@@ -799,12 +891,17 @@ async function run() {
       TARGET_DATE: targetDate,
       TIME_ZONE: timeZone,
     },
-    itemCount: items.length,
-    items,
+    feishuPayload,
+    headerName,
+    itemCount: recent.items.length,
+    items: recent.items,
     matchStrategy,
+    messageMarkdown,
     messageText,
     mode,
     previewOnly,
+    referenceTime: new Date(referenceTimestamp).toISOString(),
+    referenceTimeText: formatDateTimeText(referenceTimestamp, timeZone),
     report,
     send,
     status:
@@ -815,6 +912,10 @@ async function run() {
           : "failed",
     targetDate,
     targetDateText,
+    windowEndText: formatDateTimeText(referenceTimestamp, timeZone),
+    windowHours: WINDOW_HOURS,
+    windowStart: new Date(recent.cutoffTimestamp).toISOString(),
+    windowStartText: formatDateTimeText(recent.cutoffTimestamp, timeZone),
   };
 
   const markdown = buildMarkdown(result);
@@ -838,6 +939,7 @@ run().catch((error) => {
       "The run failed before extraction or sending could finish.",
       "Check preview/latest.log for the full stack trace and execution context.",
     ],
+    displayMode: "",
     env: {
       FEISHU_KEYWORD: maskEnvPresence(process.env.FEISHU_KEYWORD),
       FEISHU_SECRET: maskEnvPresence(process.env.FEISHU_SECRET),
@@ -846,12 +948,16 @@ run().catch((error) => {
       TARGET_DATE: cleanEnv(process.env.TARGET_DATE) || "(auto)",
       TIME_ZONE: cleanEnv(process.env.TIME_ZONE) || "Asia/Shanghai",
     },
+    headerName: buildHeaderName(process.env.FEISHU_KEYWORD),
     itemCount: 0,
     items: [],
     matchStrategy: "none",
+    messageMarkdown: "",
     messageText: "",
     mode: "failed",
     previewOnly: envFlag("PREVIEW_ONLY", false),
+    referenceTime: "",
+    referenceTimeText: "",
     report: null,
     send: {
       attempted: false,
@@ -865,9 +971,13 @@ run().catch((error) => {
     status: "failed",
     targetDate: cleanEnv(process.env.TARGET_DATE) || "(auto)",
     targetDateText: "",
+    windowEndText: "",
+    windowHours: WINDOW_HOURS,
+    windowStart: "",
+    windowStartText: "",
   };
-
   const markdown = buildMarkdown(result);
+
   finalizeArtifacts({ logger, markdown, result, runStamp });
   process.exitCode = 1;
 });
