@@ -2,7 +2,8 @@ name: Push 2Firsts Daily Report
 
 on:
   schedule:
-    - cron: "36 1 * * *"
+    - cron: "30 1 * * *"
+    - cron: "30 2 * * *"
   workflow_dispatch:
     inputs:
       target_date:
@@ -17,6 +18,14 @@ on:
           - "false"
           - "true"
         default: "false"
+      target_group:
+        description: Select which Feishu group should receive the manual run.
+        required: true
+        type: choice
+        options:
+          - "A"
+          - "B"
+        default: "A"
 
 jobs:
   run-job:
@@ -34,14 +43,69 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Resolve target A schedule
+        if: github.event_name == 'schedule' && github.event.schedule == '30 1 * * *'
+        env:
+          FEISHU_WEBHOOK_VALUE: ${{ secrets.FEISHU_WEBHOOK_A }}
+          FEISHU_SECRET_VALUE: ${{ secrets.FEISHU_SECRET_A }}
+          FEISHU_KEYWORD_VALUE: ${{ secrets.FEISHU_KEYWORD_A }}
+        run: |
+          echo "PUSH_TARGET=A" >> "$GITHUB_ENV"
+          echo "FEISHU_WEBHOOK=$FEISHU_WEBHOOK_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_SECRET=$FEISHU_SECRET_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_KEYWORD=$FEISHU_KEYWORD_VALUE" >> "$GITHUB_ENV"
+
+      - name: Resolve target B schedule
+        if: github.event_name == 'schedule' && github.event.schedule == '30 2 * * *'
+        env:
+          FEISHU_WEBHOOK_VALUE: ${{ secrets.FEISHU_WEBHOOK_B }}
+          FEISHU_SECRET_VALUE: ${{ secrets.FEISHU_SECRET_B }}
+          FEISHU_KEYWORD_VALUE: ${{ secrets.FEISHU_KEYWORD_B }}
+        run: |
+          echo "PUSH_TARGET=B" >> "$GITHUB_ENV"
+          echo "FEISHU_WEBHOOK=$FEISHU_WEBHOOK_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_SECRET=$FEISHU_SECRET_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_KEYWORD=$FEISHU_KEYWORD_VALUE" >> "$GITHUB_ENV"
+
+      - name: Resolve target A manual
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_group == 'A'
+        env:
+          FEISHU_WEBHOOK_VALUE: ${{ secrets.FEISHU_WEBHOOK_A }}
+          FEISHU_SECRET_VALUE: ${{ secrets.FEISHU_SECRET_A }}
+          FEISHU_KEYWORD_VALUE: ${{ secrets.FEISHU_KEYWORD_A }}
+        run: |
+          echo "PUSH_TARGET=A" >> "$GITHUB_ENV"
+          echo "FEISHU_WEBHOOK=$FEISHU_WEBHOOK_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_SECRET=$FEISHU_SECRET_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_KEYWORD=$FEISHU_KEYWORD_VALUE" >> "$GITHUB_ENV"
+
+      - name: Resolve target B manual
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_group == 'B'
+        env:
+          FEISHU_WEBHOOK_VALUE: ${{ secrets.FEISHU_WEBHOOK_B }}
+          FEISHU_SECRET_VALUE: ${{ secrets.FEISHU_SECRET_B }}
+          FEISHU_KEYWORD_VALUE: ${{ secrets.FEISHU_KEYWORD_B }}
+        run: |
+          echo "PUSH_TARGET=B" >> "$GITHUB_ENV"
+          echo "FEISHU_WEBHOOK=$FEISHU_WEBHOOK_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_SECRET=$FEISHU_SECRET_VALUE" >> "$GITHUB_ENV"
+          echo "FEISHU_KEYWORD=$FEISHU_KEYWORD_VALUE" >> "$GITHUB_ENV"
+
+      - name: Validate target config
+        run: |
+          test -n "$PUSH_TARGET"
+          test -n "$FEISHU_WEBHOOK"
+          echo "Resolved push target: $PUSH_TARGET"
+
       - name: Run sender
         env:
           TARGET_DATE: ${{ github.event.inputs.target_date }}
           PREVIEW_ONLY: ${{ github.event.inputs.preview_only || 'false' }}
           TIME_ZONE: Asia/Shanghai
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
-          FEISHU_KEYWORD: ${{ secrets.FEISHU_KEYWORD }}
+          PUSH_TARGET: ${{ env.PUSH_TARGET }}
+          FEISHU_WEBHOOK: ${{ env.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ env.FEISHU_SECRET }}
+          FEISHU_KEYWORD: ${{ env.FEISHU_KEYWORD }}
         run: node report-run.js
 
       - name: Print preview summary
@@ -52,6 +116,13 @@ jobs:
             cat preview/latest.log
           else
             echo "preview/latest.log not found"
+          fi
+
+          echo "=== preview/latest.json ==="
+          if [ -f preview/latest.json ]; then
+            cat preview/latest.json
+          else
+            echo "preview/latest.json not found"
           fi
 
           echo "=== preview/latest.md ==="
@@ -65,7 +136,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 2firsts-preview
+          name: 2firsts-preview-${{ env.PUSH_TARGET || 'unknown' }}
           path: preview/
           if-no-files-found: warn
-
