@@ -12,6 +12,8 @@ const MAX_ITEMS = 8;
 const DEFAULT_HEADER_NAME = "2F daily report";
 const REPORT_EMPTY_MESSAGE = "当日早报页面暂无可解析条目";
 const HOT_EMPTY_MESSAGE = `最近${WINDOW_HOURS}小时内暂无新发布文章`;
+const FEISHU_RETRY_DELAYS_MS = [30000, 60000, 120000];
+const FEISHU_RETRYABLE_CODES = new Set([11232, 19006]);
 const HTML_ENTITIES = {
   amp: "&",
   apos: "'",
@@ -670,7 +672,38 @@ function buildFeishuSignature(secret) {
   return { sign, timestamp };
 }
 
-async function sendToFeishu({ logger, payload, secret, webhook }) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatRetryDelay(ms) {
+  if (ms % 60000 === 0) {
+    return `${ms / 60000} min`;
+  }
+
+  return `${ms / 1000}s`;
+}
+
+function isRetryableFeishuSend(sendResult) {
+  if (!sendResult || sendResult.success || !sendResult.attempted) {
+    return false;
+  }
+
+  const code = Number(sendResult.responseCode);
+  const message = cleanEnv(sendResult.responseMessage).toLowerCase();
+  const reason = cleanEnv(sendResult.reason).toLowerCase();
+  const httpStatus = Number(sendResult.httpStatus);
+
+  return (
+    (Number.isFinite(code) && FEISHU_RETRYABLE_CODES.has(code)) ||
+    message.includes("frequency limited") ||
+    message.includes("internal error") ||
+    reason.startsWith("failed to call feishu webhook:") ||
+    (Number.isFinite(httpStatus) && httpStatus >= 500)
+  );
+}
+
+async function sendToFeishu({ logger, payload, secret, webhook, attemptLabel = "" }) {
   const url = resolveWebhookUrl(webhook);
 
   if (!url) {
@@ -691,9 +724,11 @@ async function sendToFeishu({ logger, payload, secret, webhook }) {
   }
 
   logger.info(
-    `Sending Feishu ${finalPayload.msg_type} message (rows=${
-      finalPayload.content?.post?.zh_cn?.content?.length || 0
-    }, signature=${secret ? "enabled" : "disabled"})`,
+    `Sending Feishu ${finalPayload.msg_type} message${
+      attemptLabel ? ` [${attemptLabel}]` : ""
+    } (rows=${finalPayload.content?.post?.zh_cn?.content?.length || 0}, signature=${
+      secret ? "enabled" : "disabled"
+    })`,
   );
 
   try {
@@ -748,6 +783,52 @@ async function sendToFeishu({ logger, payload, secret, webhook }) {
   }
 }
 
+async function sendToFeishuWithRetry({ logger, payload, secret, webhook }) {
+  const totalAttempts = FEISHU_RETRY_DELAYS_MS.length + 1;
+  let sendResult = null;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    sendResult = await sendToFeishu({
+      logger,
+      payload,
+      secret,
+      webhook,
+      attemptLabel: `${attempt}/${totalAttempts}`,
+    });
+
+    if (sendResult.success) {
+      return { ...sendResult, attemptCount: attempt, retried: attempt > 1 };
+    }
+
+    if (attempt >= totalAttempts || !isRetryableFeishuSend(sendResult)) {
+      return { ...sendResult, attemptCount: attempt, retried: attempt > 1 };
+    }
+
+    const delayMs = FEISHU_RETRY_DELAYS_MS[attempt - 1];
+    const codeText =
+      sendResult.responseCode === null || typeof sendResult.responseCode === "undefined"
+        ? "n/a"
+        : sendResult.responseCode;
+    const messageText = sendResult.responseMessage || sendResult.reason || "(empty)";
+
+    logger.warn(
+      `Feishu send failed on attempt ${attempt}/${totalAttempts} with code=${codeText}, message=${messageText}. Retrying in ${formatRetryDelay(delayMs)}.`,
+    );
+    await sleep(delayMs);
+  }
+
+  return {
+    attempted: false,
+    attemptCount: 0,
+    retried: false,
+    reason: "Feishu send retry wrapper exited unexpectedly.",
+    responseBody: "",
+    responseCode: null,
+    responseMessage: "",
+    status: "failed",
+    success: false,
+  };
+}
 function buildMarkdown(result) {
   const lines = [
     "# 2Firsts CN Daily Run",
@@ -774,6 +855,8 @@ function buildMarkdown(result) {
   lines.push(`- status: ${result.status}`);
   lines.push(`- sendStatus: ${result.send.status}`);
   lines.push(`- sendReason: ${result.send.reason}`);
+  lines.push(`- sendAttempts: ${result.send.attemptCount ?? 0}`);
+  lines.push(`- sendRetried: ${result.send.retried ? "true" : "false"}`);
   lines.push(`- webhook: ${result.env.FEISHU_WEBHOOK}`);
   lines.push(`- secret: ${result.env.FEISHU_SECRET}`);
   lines.push(`- keyword: ${result.env.FEISHU_KEYWORD}`);
@@ -971,6 +1054,8 @@ async function run() {
 
   let send = {
     attempted: false,
+    attemptCount: 0,
+    retried: false,
     reason: "PREVIEW_ONLY=true, message was not sent.",
     responseBody: "",
     responseCode: null,
@@ -980,7 +1065,7 @@ async function run() {
   };
 
   if (!previewOnly) {
-    send = await sendToFeishu({
+    send = await sendToFeishuWithRetry({
       logger,
       payload: feishuPayload,
       secret: feishuSecret,
@@ -991,6 +1076,8 @@ async function run() {
   logger.info(`CONTENT_SOURCE=${contentSource}`);
   logger.info(`Send status=${send.status}`);
   logger.info(`Send reason=${send.reason}`);
+  logger.info(`Send attempts=${send.attemptCount}`);
+  logger.info(`Send retried=${send.retried}`);
 
   if (!previewOnly && !feishuWebhook) {
     diagnostics.push("FEISHU_WEBHOOK is missing, so extraction can succeed while sending still fails.");
@@ -1089,6 +1176,8 @@ run().catch((error) => {
     report: null,
     send: {
       attempted: false,
+      attemptCount: 0,
+      retried: false,
       reason: error.message,
       responseBody: "",
       responseCode: null,
