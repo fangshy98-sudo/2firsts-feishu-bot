@@ -10,6 +10,7 @@ const WINDOW_HOURS = 48;
 const MAX_CANDIDATES = 24;
 const MAX_ITEMS = 8;
 const DEFAULT_HEADER_NAME = "2F daily report";
+const DEFAULT_MESSAGE_PREFIX = "2F早报";
 const REPORT_EMPTY_MESSAGE = "当日早报页面暂无可解析条目";
 const HOT_EMPTY_MESSAGE = `最近${WINDOW_HOURS}小时内暂无新发布文章`;
 const FEISHU_RETRY_DELAYS_MS = [30000, 60000, 120000];
@@ -829,6 +830,56 @@ async function sendToFeishuWithRetry({ logger, payload, secret, webhook }) {
     success: false,
   };
 }
+function buildDeliveryRows(result) {
+  if (result.mode === "morning_report") {
+    return result.items.map((item) => ({
+      content: item.text,
+      date: result.targetDate,
+      index: item.index,
+      link: item.url || "",
+      source: item.source || "",
+    }));
+  }
+
+  return result.items.map((item) => ({
+    content: item.title,
+    date: item.publishedAtText || result.targetDate,
+    index: item.index,
+    link: item.url || "",
+    source: item.source || "",
+  }));
+}
+
+function buildDeliveryPayload(result, messagePrefix) {
+  const rows = buildDeliveryRows(result);
+
+  return {
+    bitableRows: rows.map((row) => ({
+      日期: row.date,
+      内容: row.content,
+      链接: row.link,
+    })),
+    contentSource: result.contentSource,
+    createdAt: result.createdAt,
+    deliveryMode: result.env.DELIVERY_MODE || "artifact_only",
+    displayMode: result.displayMode,
+    group: result.pushTarget,
+    headerName: result.headerName,
+    itemCount: result.itemCount,
+    matchStrategy: result.matchStrategy,
+    messageMarkdown: result.messageMarkdown,
+    messagePrefix,
+    messageText: result.messageText,
+    mode: result.mode,
+    referenceTime: result.referenceTime,
+    referenceTimeText: result.referenceTimeText,
+    reportUrl: result.report?.url || "",
+    rows,
+    targetDate: result.targetDate,
+    targetDateText: result.targetDateText,
+  };
+}
+
 function buildMarkdown(result) {
   const lines = [
     "# 2Firsts CN Daily Run",
@@ -852,6 +903,7 @@ function buildMarkdown(result) {
 
   lines.push(`- itemCount: ${result.itemCount}`);
   lines.push(`- previewOnly: ${result.previewOnly}`);
+  lines.push(`- deliveryMode: ${result.env.DELIVERY_MODE || "artifact_only"}`);
   lines.push(`- status: ${result.status}`);
   lines.push(`- sendStatus: ${result.send.status}`);
   lines.push(`- sendReason: ${result.send.reason}`);
@@ -912,14 +964,17 @@ function buildMarkdown(result) {
 }
 
 function finalizeArtifacts({ logger, markdown, result, runStamp }) {
+  const deliveryJson = result.delivery || {};
   ensureDir(PREVIEW_DIR);
   ensureDir(RUNS_DIR);
 
   const runBaseName = `run-${runStamp}`;
   writeJson(path.join(RUNS_DIR, `${runBaseName}.json`), result);
+  writeJson(path.join(RUNS_DIR, `${runBaseName}.delivery.json`), deliveryJson);
   writeUtf8(path.join(RUNS_DIR, `${runBaseName}.md`), markdown);
   writeUtf8(path.join(RUNS_DIR, `${runBaseName}.log`), logger.toString());
   writeJson(path.join(PREVIEW_DIR, "latest.json"), result);
+  writeJson(path.join(PREVIEW_DIR, "delivery.json"), deliveryJson);
   writeUtf8(path.join(PREVIEW_DIR, "latest.md"), markdown);
   writeUtf8(path.join(PREVIEW_DIR, "latest.log"), logger.toString());
 
@@ -935,18 +990,22 @@ async function run() {
   const targetDate = normalizeTargetDate(process.env.TARGET_DATE, timeZone);
   const referenceTimestamp = getReferenceTimestamp(targetDate, timeZone);
   const previewOnly = envFlag("PREVIEW_ONLY", false);
+  const deliveryMode = cleanEnv(process.env.DELIVERY_MODE) || (previewOnly ? "artifact_only" : "direct_feishu");
   const feishuWebhook = cleanEnv(process.env.FEISHU_WEBHOOK);
   const feishuSecret = cleanEnv(process.env.FEISHU_SECRET);
   const feishuKeyword = cleanEnv(process.env.FEISHU_KEYWORD);
   const pushTarget = cleanEnv(process.env.PUSH_TARGET) || "UNKNOWN";
   const headerName = buildHeaderName();
-  const keywordLine = buildKeywordLine(feishuKeyword, headerName);
+  const messagePrefix = cleanEnv(process.env.MESSAGE_PREFIX) || feishuKeyword || DEFAULT_MESSAGE_PREFIX;
+  const keywordLine = buildKeywordLine(messagePrefix, headerName);
   const runStamp = getRunStamp();
 
   logger.info(`TARGET_DATE=${targetDate}`);
   logger.info(`PREVIEW_ONLY=${previewOnly}`);
+  logger.info(`DELIVERY_MODE=${deliveryMode}`);
   logger.info(`TIME_ZONE=${timeZone}`);
   logger.info(`PUSH_TARGET=${pushTarget}`);
+  logger.info(`MESSAGE_PREFIX=${messagePrefix}`);
   logger.info(`FEISHU_WEBHOOK=${maskEnvPresence(feishuWebhook)}`);
   logger.info(`FEISHU_SECRET=${maskEnvPresence(feishuSecret)}`);
   logger.info(`FEISHU_KEYWORD=${maskEnvPresence(feishuKeyword)}`);
@@ -1052,19 +1111,47 @@ async function run() {
     logger.info(`Recent article count within ${WINDOW_HOURS} hours: ${items.length}`);
   }
 
-  let send = {
-    attempted: false,
-    attemptCount: 0,
-    retried: false,
-    reason: "PREVIEW_ONLY=true, message was not sent.",
-    responseBody: "",
-    responseCode: null,
-    responseMessage: "",
-    status: "skipped",
-    success: false,
-  };
+  const shouldSkipDirectFeishuSend =
+    !previewOnly && deliveryMode === "direct_feishu" && mode === "recent_hot" && items.length === 0;
 
-  if (!previewOnly) {
+  let send =
+    deliveryMode === "artifact_only"
+      ? {
+          attempted: false,
+          attemptCount: 0,
+          retried: false,
+          reason: "Delivery is handled by Feishu workflow; GitHub generated artifacts only.",
+          responseBody: "",
+          responseCode: null,
+          responseMessage: "",
+          status: "delegated",
+          success: true,
+        }
+      : shouldSkipDirectFeishuSend
+        ? {
+            attempted: false,
+            attemptCount: 0,
+            retried: false,
+            reason: `No articles were published within the latest ${WINDOW_HOURS} hours, so no Feishu message was sent.`,
+            responseBody: "",
+            responseCode: null,
+            responseMessage: "",
+            status: "skipped",
+            success: true,
+          }
+        : {
+            attempted: false,
+            attemptCount: 0,
+            retried: false,
+            reason: "PREVIEW_ONLY=true, message was not sent.",
+            responseBody: "",
+            responseCode: null,
+            responseMessage: "",
+            status: "skipped",
+            success: false,
+          };
+
+  if (!previewOnly && deliveryMode === "direct_feishu" && !shouldSkipDirectFeishuSend) {
     send = await sendToFeishuWithRetry({
       logger,
       payload: feishuPayload,
@@ -1079,24 +1166,34 @@ async function run() {
   logger.info(`Send attempts=${send.attemptCount}`);
   logger.info(`Send retried=${send.retried}`);
 
-  if (!previewOnly && !feishuWebhook) {
+  if (deliveryMode === "artifact_only") {
+    diagnostics.push("Delivery is delegated to Feishu workflow; GitHub only generates JSON and artifact outputs.");
+  }
+
+  if (shouldSkipDirectFeishuSend) {
+    diagnostics.push("No Feishu message was sent because the rolling 48-hour article window was empty.");
+  }
+
+  if (!previewOnly && deliveryMode === "direct_feishu" && !feishuWebhook) {
     diagnostics.push("FEISHU_WEBHOOK is missing, so extraction can succeed while sending still fails.");
   }
 
-  if (!previewOnly && feishuWebhook && !feishuSecret) {
+  if (!previewOnly && deliveryMode === "direct_feishu" && feishuWebhook && !feishuSecret) {
     diagnostics.push("If your Feishu bot requires signature verification, an empty FEISHU_SECRET can cause the webhook call to fail.");
   }
 
-  const result = {
+  let result = {
     baseUrl: BASE_URL,
     contentSource,
     createdAt: new Date().toISOString(),
     diagnostics,
     displayMode,
     env: {
+      DELIVERY_MODE: deliveryMode,
       FEISHU_KEYWORD: maskEnvPresence(feishuKeyword),
       FEISHU_SECRET: maskEnvPresence(feishuSecret),
       FEISHU_WEBHOOK: maskEnvPresence(feishuWebhook),
+      MESSAGE_PREFIX: messagePrefix,
       PREVIEW_ONLY: String(previewOnly),
       PUSH_TARGET: pushTarget,
       TARGET_DATE: targetDate,
@@ -1117,7 +1214,7 @@ async function run() {
     report,
     send,
     status:
-      previewOnly || send.status === "sent"
+      previewOnly || send.success
         ? "success"
         : send.status === "skipped"
           ? "warning"
@@ -1130,10 +1227,12 @@ async function run() {
     windowStartText,
   };
 
+  result.delivery = buildDeliveryPayload(result, messagePrefix);
+
   const markdown = buildMarkdown(result);
   finalizeArtifacts({ logger, markdown, result, runStamp });
 
-  if (!previewOnly && !send.success) {
+  if (!previewOnly && deliveryMode === "direct_feishu" && !send.success) {
     process.exitCode = 1;
   }
 }
@@ -1154,9 +1253,11 @@ run().catch((error) => {
     ],
     displayMode: "",
     env: {
+      DELIVERY_MODE: cleanEnv(process.env.DELIVERY_MODE) || "artifact_only",
       FEISHU_KEYWORD: maskEnvPresence(process.env.FEISHU_KEYWORD),
       FEISHU_SECRET: maskEnvPresence(process.env.FEISHU_SECRET),
       FEISHU_WEBHOOK: maskEnvPresence(process.env.FEISHU_WEBHOOK),
+      MESSAGE_PREFIX: cleanEnv(process.env.MESSAGE_PREFIX) || DEFAULT_MESSAGE_PREFIX,
       PREVIEW_ONLY: cleanEnv(process.env.PREVIEW_ONLY) || "false",
       PUSH_TARGET: cleanEnv(process.env.PUSH_TARGET) || "UNKNOWN",
       TARGET_DATE: cleanEnv(process.env.TARGET_DATE) || "(auto)",
@@ -1185,6 +1286,7 @@ run().catch((error) => {
       status: "failed",
       success: false,
     },
+    delivery: null,
     status: "failed",
     targetDate: cleanEnv(process.env.TARGET_DATE) || "(auto)",
     targetDateText: "",
